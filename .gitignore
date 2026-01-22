@@ -1,0 +1,21 @@
+# Build artifacts
+/target
+
+# Cargo lock is included for binary crates (this is a CLI tool)
+# Cargo.lock
+
+# Environment files with secrets
+.envrc
+.env
+.env.*
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Debug files
+*.pdb
