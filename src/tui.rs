@@ -12,6 +12,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
+use serde::Deserialize;
 use std::io::{self, BufRead, BufReader, Stdout};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -19,6 +20,52 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use crate::{strip_ansi, truncate};
+
+/// Claude stream-json event types
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+enum ClaudeEvent {
+    #[serde(rename = "assistant")]
+    Assistant { message: AssistantMessage },
+    #[serde(rename = "user")]
+    User { message: UserMessage },
+    #[serde(rename = "result")]
+    Result { result: String, #[allow(dead_code)] cost_usd: Option<f64> },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssistantMessage {
+    content: Vec<ContentBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserMessage {
+    content: Vec<ContentBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+enum ContentBlock {
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse { id: String, name: String, #[allow(dead_code)] input: serde_json::Value },
+    #[serde(rename = "tool_result")]
+    ToolResult { tool_use_id: String, content: Option<serde_json::Value> },
+    #[serde(other)]
+    Unknown,
+}
+
+/// A tool call with its name and a summary of the result
+#[derive(Clone, Debug)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub result_summary: Option<String>,
+}
 
 fn truncate_line(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
@@ -34,6 +81,7 @@ pub struct Message {
     pub role: String,
     pub content: String,
     pub turn: usize,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -60,6 +108,7 @@ pub struct App {
     pub editing_message_index: Option<usize>,
     pub streaming_role: Option<String>,
     pub streaming_content: String,
+    pub streaming_tool_calls: Vec<ToolCall>,
 }
 
 impl App {
@@ -84,12 +133,14 @@ impl App {
             editing_message_index: None,
             streaming_role: None,
             streaming_content: String::new(),
+            streaming_tool_calls: Vec::new(),
         }
     }
 
     pub fn start_streaming(&mut self, role: &str) {
         self.streaming_role = Some(role.to_string());
         self.streaming_content.clear();
+        self.streaming_tool_calls.clear();
     }
 
     pub fn append_streaming_line(&mut self, line: &str) {
@@ -99,10 +150,21 @@ impl App {
         self.streaming_content.push_str(line);
     }
 
-    pub fn finish_streaming(&mut self) -> Option<(String, String)> {
+    pub fn add_streaming_tool_call(&mut self, tool_call: ToolCall) {
+        self.streaming_tool_calls.push(tool_call);
+    }
+
+    pub fn update_streaming_tool_result(&mut self, tool_use_id: &str, summary: String) {
+        if let Some(tc) = self.streaming_tool_calls.iter_mut().find(|tc| tc.id == tool_use_id) {
+            tc.result_summary = Some(summary);
+        }
+    }
+
+    pub fn finish_streaming(&mut self) -> Option<(String, String, Vec<ToolCall>)> {
         if let Some(role) = self.streaming_role.take() {
             let content = std::mem::take(&mut self.streaming_content);
-            Some((role, content))
+            let tool_calls = std::mem::take(&mut self.streaming_tool_calls);
+            Some((role, content, tool_calls))
         } else {
             None
         }
@@ -122,21 +184,70 @@ impl App {
         self.scroll = max_scroll;
     }
 
-    pub fn add_message(&mut self, role: &str, content: &str) {
+    pub fn add_message(&mut self, role: &str, content: &str, tool_calls: Vec<ToolCall>) {
         self.messages.push(Message {
             role: role.to_string(),
             content: content.to_string(),
             turn: self.turn,
+            tool_calls,
         });
     }
 }
 
 enum AgentResult {
     MakerLine(String),
+    MakerToolCall(ToolCall),
+    MakerToolResult { tool_use_id: String, summary: String },
     CriticLine(String),
     MakerDone,
     CriticDone,
     Error(String),
+}
+
+/// Summarize tool result content for display
+fn summarize_tool_result(content: &Option<serde_json::Value>) -> String {
+    match content {
+        None => "done".to_string(),
+        Some(serde_json::Value::String(s)) => {
+            let lines: Vec<&str> = s.lines().collect();
+            if lines.len() <= 3 {
+                s.chars().take(100).collect::<String>()
+                    + if s.len() > 100 { "..." } else { "" }
+            } else {
+                format!("{} lines", lines.len())
+            }
+        }
+        Some(serde_json::Value::Array(arr)) => {
+            // Check if it's an array of content blocks
+            let mut text_parts = Vec::new();
+            for item in arr {
+                if let Some(obj) = item.as_object() {
+                    if obj.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
+                            text_parts.push(text);
+                        }
+                    }
+                }
+            }
+            if !text_parts.is_empty() {
+                let combined = text_parts.join(" ");
+                let lines: Vec<&str> = combined.lines().collect();
+                if lines.len() <= 3 {
+                    combined.chars().take(100).collect::<String>()
+                        + if combined.len() > 100 { "..." } else { "" }
+                } else {
+                    format!("{} lines", lines.len())
+                }
+            } else {
+                format!("{} items", arr.len())
+            }
+        }
+        Some(v) => {
+            let s = v.to_string();
+            s.chars().take(50).collect::<String>()
+                + if s.len() > 50 { "..." } else { "" }
+        }
+    }
 }
 
 fn run_maker_streaming(
@@ -147,6 +258,8 @@ fn run_maker_streaming(
 ) {
     let mut cmd = Command::new("claude");
     cmd.arg("-p");
+    cmd.arg("--verbose");
+    cmd.arg("--output-format").arg("stream-json");
     cmd.arg("--dangerously-skip-permissions");
     cmd.arg("--permission-mode").arg("acceptEdits");
 
@@ -172,8 +285,51 @@ fn run_maker_streaming(
         Ok(mut child) => {
             if let Some(stdout) = child.stdout.take() {
                 let reader = BufReader::new(stdout);
+
                 for line in reader.lines().flatten() {
-                    let _ = tx.send(AgentResult::MakerLine(line));
+                    // Try to parse as JSON event
+                    if let Ok(event) = serde_json::from_str::<ClaudeEvent>(&line) {
+                        match event {
+                            ClaudeEvent::Assistant { message } => {
+                                for block in message.content {
+                                    match block {
+                                        ContentBlock::Text { text } => {
+                                            let _ = tx.send(AgentResult::MakerLine(text));
+                                        }
+                                        ContentBlock::ToolUse { id, name, .. } => {
+                                            // Send tool call with pending result
+                                            let _ = tx.send(AgentResult::MakerToolCall(ToolCall {
+                                                id,
+                                                name,
+                                                result_summary: None,
+                                            }));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            ClaudeEvent::User { message } => {
+                                for block in message.content {
+                                    if let ContentBlock::ToolResult { tool_use_id, content } = block {
+                                        // Send update for the specific tool by ID
+                                        let summary = summarize_tool_result(&content);
+                                        let _ = tx.send(AgentResult::MakerToolResult {
+                                            tool_use_id,
+                                            summary,
+                                        });
+                                    }
+                                }
+                            }
+                            ClaudeEvent::Result { result, .. } => {
+                                // Final result text
+                                if !result.is_empty() {
+                                    let _ = tx.send(AgentResult::MakerLine(result));
+                                }
+                            }
+                            ClaudeEvent::Unknown => {}
+                        }
+                    }
+                    // Ignore unparseable lines (they might be partial JSON or other output)
                 }
             }
             let status = child.wait();
@@ -301,6 +457,14 @@ fn run_app(
                     new_content = true;
                     app.append_streaming_line(&line);
                 }
+                AgentResult::MakerToolCall(tool_call) => {
+                    new_content = true;
+                    app.add_streaming_tool_call(tool_call);
+                }
+                AgentResult::MakerToolResult { tool_use_id, summary } => {
+                    new_content = true;
+                    app.update_streaming_tool_result(&tool_use_id, summary);
+                }
                 AgentResult::CriticLine(mut line) => {
                     if strip_ansi_codes {
                         line = strip_ansi(&line);
@@ -310,8 +474,8 @@ fn run_app(
                 }
                 AgentResult::MakerDone => {
                     app.request_in_flight = false;
-                    if let Some((role, content)) = app.finish_streaming() {
-                        app.add_message(&role, &content);
+                    if let Some((role, content, tool_calls)) = app.finish_streaming() {
+                        app.add_message(&role, &content, tool_calls);
 
                         if app.state == AppState::Running {
                             app.status_message = "Running critic...".to_string();
@@ -331,8 +495,8 @@ fn run_app(
                 }
                 AgentResult::CriticDone => {
                     app.request_in_flight = false;
-                    if let Some((role, content)) = app.finish_streaming() {
-                        app.add_message(&role, &content);
+                    if let Some((role, content, tool_calls)) = app.finish_streaming() {
+                        app.add_message(&role, &content, tool_calls);
                         app.turn += 1;
 
                         if app.max_turns > 0 && app.turn >= app.max_turns {
@@ -357,9 +521,9 @@ fn run_app(
                 AgentResult::Error(e) => {
                     app.request_in_flight = false;
                     // Commit partial content if any
-                    if let Some((role, content)) = app.finish_streaming() {
+                    if let Some((role, content, tool_calls)) = app.finish_streaming() {
                         if !content.is_empty() {
-                            app.add_message(&role, &format!("{}\n\n[Error: {}]", content, e));
+                            app.add_message(&role, &format!("{}\n\n[Error: {}]", content, e), tool_calls);
                         }
                     }
                     app.status_message = format!("Error: {}", e);
@@ -560,15 +724,50 @@ fn run_app(
 }
 
 fn ui(f: &mut Frame, app: &mut App) -> u16 {
+    // Calculate layout based on whether we have a task to display
+    let has_task = app.task.is_some() && app.state != AppState::WaitingForTask;
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(3),
-        ])
+        .constraints(if has_task {
+            vec![
+                Constraint::Length(3),  // Task display
+                Constraint::Min(3),     // Messages
+                Constraint::Length(3),  // Status bar
+            ]
+        } else {
+            vec![
+                Constraint::Length(0),  // No task display
+                Constraint::Min(3),     // Messages/input
+                Constraint::Length(3),  // Status bar
+            ]
+        })
         .split(f.size());
 
-    let content_height = chunks[0].height.saturating_sub(2); // Account for borders
+    // Render task display if we have one
+    if has_task {
+        if let Some(ref task) = app.task {
+            let task_block = Block::default()
+                .borders(Borders::ALL)
+                .title(" Task ");
+
+            // Truncate task to fit in one line
+            let max_task_len = chunks[0].width.saturating_sub(4) as usize;
+            let display_task = if task.len() > max_task_len {
+                format!("{}...", &task[..max_task_len.saturating_sub(3)])
+            } else {
+                task.clone()
+            };
+
+            let task_para = Paragraph::new(display_task)
+                .block(task_block)
+                .style(Style::default().fg(Color::White));
+
+            f.render_widget(task_para, chunks[0]);
+        }
+    }
+
+    let content_height = chunks[1].height.saturating_sub(2); // Account for borders
 
     if app.state == AppState::WaitingForTask {
         let input_block = Block::default()
@@ -578,12 +777,12 @@ fn ui(f: &mut Frame, app: &mut App) -> u16 {
         let input_text = Paragraph::new(app.edit_buffer.as_str())
             .block(input_block)
             .wrap(Wrap { trim: false });
-        f.render_widget(input_text, chunks[0]);
+        f.render_widget(input_text, chunks[1]);
 
         // Guard against divide-by-zero for very narrow terminals
-        let usable_width = chunks[0].width.saturating_sub(2).max(1);
-        let cursor_x = chunks[0].x + 1 + (app.edit_cursor as u16 % usable_width);
-        let cursor_y = chunks[0].y + 1 + (app.edit_cursor as u16 / usable_width);
+        let usable_width = chunks[1].width.saturating_sub(2).max(1);
+        let cursor_x = chunks[1].x + 1 + (app.edit_cursor as u16 % usable_width);
+        let cursor_y = chunks[1].y + 1 + (app.edit_cursor as u16 / usable_width);
         f.set_cursor(cursor_x, cursor_y);
     } else {
         let messages_block = Block::default()
@@ -610,6 +809,18 @@ fn ui(f: &mut Frame, app: &mut App) -> u16 {
                 header_style,
             )));
 
+            // Display tool calls if any
+            if !msg.tool_calls.is_empty() {
+                let tool_style = Style::default().fg(Color::Magenta);
+                for tc in &msg.tool_calls {
+                    let result_text = tc.result_summary.as_deref().unwrap_or("...");
+                    lines.push(Line::from(Span::styled(
+                        format!("  [{}] {}", tc.name, result_text),
+                        tool_style,
+                    )));
+                }
+            }
+
             for line in msg.content.lines() {
                 lines.push(Line::from(Span::styled(truncate_line(line, 500), content_style)));
             }
@@ -621,7 +832,7 @@ fn ui(f: &mut Frame, app: &mut App) -> u16 {
 
         // Show streaming content if any
         if let Some(ref role) = app.streaming_role {
-            if !app.streaming_content.is_empty() || app.request_in_flight {
+            if !app.streaming_content.is_empty() || !app.streaming_tool_calls.is_empty() || app.request_in_flight {
                 let (header_style, content_style) = if role == "maker" {
                     (
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -643,6 +854,18 @@ fn ui(f: &mut Frame, app: &mut App) -> u16 {
                     header_style,
                 )));
 
+                // Display streaming tool calls
+                if !app.streaming_tool_calls.is_empty() {
+                    let tool_style = Style::default().fg(Color::Magenta);
+                    for tc in &app.streaming_tool_calls {
+                        let result_text = tc.result_summary.as_deref().unwrap_or("...");
+                        lines.push(Line::from(Span::styled(
+                            format!("  [{}] {}", tc.name, result_text),
+                            tool_style,
+                        )));
+                    }
+                }
+
                 for line in app.streaming_content.lines() {
                     lines.push(Line::from(Span::styled(truncate_line(line, 500), content_style)));
                 }
@@ -656,7 +879,7 @@ fn ui(f: &mut Frame, app: &mut App) -> u16 {
             .wrap(Wrap { trim: false })
             .scroll((app.scroll, 0));
 
-        f.render_widget(paragraph, chunks[0]);
+        f.render_widget(paragraph, chunks[1]);
     }
 
     // Status bar
@@ -695,7 +918,7 @@ fn ui(f: &mut Frame, app: &mut App) -> u16 {
     ]))
     .block(Block::default().borders(Borders::ALL));
 
-    f.render_widget(status, chunks[1]);
+    f.render_widget(status, chunks[2]);
 
     // Edit overlay
     if app.state == AppState::Editing {

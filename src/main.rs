@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::thread;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 mod tui;
@@ -48,7 +50,12 @@ pub fn strip_ansi(input: &str) -> String {
 }
 
 /// Run Claude in print mode and return its output
-fn run_maker(cwd: &Option<PathBuf>, prompt: &str, is_continuation: bool) -> Result<String> {
+fn run_maker(
+    cwd: &Option<PathBuf>,
+    prompt: &str,
+    is_continuation: bool,
+    stream_strip_ansi: bool,
+) -> Result<String> {
     let mut cmd = Command::new("claude");
     cmd.arg("-p");
     cmd.arg("--dangerously-skip-permissions");
@@ -75,24 +82,50 @@ fn run_maker(cwd: &Option<PathBuf>, prompt: &str, is_continuation: bool) -> Resu
     log_line("maker", &format!("prompt: {}...",
         if prompt.len() > 80 { &prompt[..80] } else { prompt }));
 
-    let output = cmd.output().context("failed to run claude")?;
+    let mut child = cmd.spawn().context("failed to spawn claude")?;
+    let stdout = child.stdout.take().context("missing maker stdout")?;
+    let stderr = child.stderr.take().context("missing maker stderr")?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stderr_handle = thread::spawn(move || read_to_string(stderr));
+    let stdout = stream_and_collect(stdout, stream_strip_ansi)?;
+    let status = child.wait().context("failed to wait for claude")?;
+    let stderr = join_reader(stderr_handle);
 
     if !stderr.is_empty() && !stderr.contains("Shell cwd was reset") {
         log_line("maker-err", &stderr);
     }
 
-    if !output.status.success() {
-        anyhow::bail!("maker exited with status: {}", output.status);
+    if !status.success() {
+        anyhow::bail!("maker exited with status: {}", status);
     }
 
     Ok(stdout)
 }
 
+/// Build the critic meta-prompt that frames the review context
+fn build_critic_prompt(task: &str, maker_output: &str) -> String {
+    format!(
+        r#"ROLE: CODE REVIEWER
+You are acting as a CODE REVIEWER. Your job is to evaluate the maker's work for the task below.
+Do not offer to do things. Review, comment, critique and guide the maker.
+
+## Original Task
+{task}
+
+## Maker's Output
+Below is the maker's response to the task. Treat it as the full output to be reviewed.
+
+---
+{maker_output}
+---
+"#,
+        task = task,
+        maker_output = maker_output
+    )
+}
+
 /// Run Codex exec and return its output
-fn run_critic(cwd: &Option<PathBuf>, prompt: &str) -> Result<String> {
+fn run_critic(cwd: &Option<PathBuf>, prompt: &str, stream_strip_ansi: bool) -> Result<String> {
     let mut cmd = Command::new("codex");
     cmd.arg("exec");
     cmd.arg("--full-auto");
@@ -115,17 +148,21 @@ fn run_critic(cwd: &Option<PathBuf>, prompt: &str) -> Result<String> {
     log_line("critic", &format!("prompt: {}...",
         if prompt.len() > 80 { &prompt[..80] } else { prompt }));
 
-    let output = cmd.output().context("failed to run codex")?;
+    let mut child = cmd.spawn().context("failed to spawn codex")?;
+    let stdout = child.stdout.take().context("missing critic stdout")?;
+    let stderr = child.stderr.take().context("missing critic stderr")?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stderr_handle = thread::spawn(move || read_to_string(stderr));
+    let stdout = stream_and_collect(stdout, stream_strip_ansi)?;
+    let status = child.wait().context("failed to wait for codex")?;
+    let stderr = join_reader(stderr_handle);
 
     if !stderr.is_empty() {
         log_line("critic-err", &stderr);
     }
 
-    if !output.status.success() {
-        anyhow::bail!("critic exited with status: {}", output.status);
+    if !status.success() {
+        anyhow::bail!("critic exited with status: {}", status);
     }
 
     Ok(stdout)
@@ -150,42 +187,46 @@ fn run_batch(args: &Args, task: &str) -> Result<()> {
     log_line("system", &format!("task: {}", task));
 
     // First maker turn - just the task
-    let mut maker_output = run_maker(&args.cwd, task, false)?;
+    println!("=== MAKER ===");
+    let mut maker_output = run_maker(&args.cwd, task, false, args.strip_ansi)?;
+    println!();
 
     if args.strip_ansi {
         maker_output = strip_ansi(&maker_output);
     }
 
     log_line("maker-out", &format!("{} bytes", maker_output.len()));
-    println!("=== MAKER ===\n{}\n", maker_output);
 
     let mut turn = 0;
 
     loop {
 
-        // Forward maker output to critic verbatim
-        let forward_text = truncate(&maker_output, args.max_forward_bytes);
+        // Build critic prompt with meta-context
+        let truncated_maker = truncate(&maker_output, args.max_forward_bytes);
+        let critic_prompt = build_critic_prompt(task, &truncated_maker);
 
-        let mut critic_output = run_critic(&args.cwd, &forward_text)?;
+        println!("=== CRITIC (turn {}) ===", turn);
+        let mut critic_output = run_critic(&args.cwd, &critic_prompt, args.strip_ansi)?;
+        println!();
 
         if args.strip_ansi {
             critic_output = strip_ansi(&critic_output);
         }
 
         log_line("critic-out", &format!("{} bytes", critic_output.len()));
-        println!("=== CRITIC (turn {}) ===\n{}\n", turn, critic_output);
 
         // Forward critic output to maker verbatim
         let feedback = truncate(&critic_output, args.max_forward_bytes);
 
-        maker_output = run_maker(&args.cwd, &feedback, true)?;
+        println!("=== MAKER (turn {}) ===", turn + 1);
+        maker_output = run_maker(&args.cwd, &feedback, true, args.strip_ansi)?;
+        println!();
 
         if args.strip_ansi {
             maker_output = strip_ansi(&maker_output);
         }
 
         log_line("maker-out", &format!("{} bytes", maker_output.len()));
-        println!("=== MAKER (turn {}) ===\n{}\n", turn + 1, maker_output);
 
         turn += 1;
 
@@ -198,6 +239,66 @@ fn run_batch(args: &Args, task: &str) -> Result<()> {
     log_line("system", &format!("done after {} turn(s)", turn));
 
     Ok(())
+}
+
+fn stream_and_collect<R: Read>(reader: R, strip_for_print: bool) -> Result<String> {
+    let mut reader = BufReader::new(reader);
+    let mut stdout = io::stdout();
+    let mut collected = Vec::new();
+    let mut buf = [0u8; 256];
+
+    loop {
+        let bytes_read = reader.read(&mut buf)?;
+        if bytes_read == 0 {
+            break;
+        }
+        let chunk = &buf[..bytes_read];
+        collected.extend_from_slice(chunk);
+
+        // Print as we receive data
+        if strip_for_print {
+            let text = String::from_utf8_lossy(chunk);
+            let stripped = strip_ansi(&text);
+            print!("{}", stripped);
+        } else {
+            // Write raw bytes directly to stdout
+            let _ = stdout.write_all(chunk);
+        }
+        let _ = stdout.flush();
+    }
+
+    Ok(String::from_utf8_lossy(&collected).to_string())
+}
+
+fn read_to_string<R: Read>(reader: R) -> Result<String> {
+    let mut reader = BufReader::new(reader);
+    let mut buf = String::new();
+    let mut collected = String::new();
+
+    loop {
+        buf.clear();
+        let bytes = reader.read_line(&mut buf)?;
+        if bytes == 0 {
+            break;
+        }
+        collected.push_str(&buf);
+    }
+
+    Ok(collected)
+}
+
+fn join_reader(handle: thread::JoinHandle<Result<String>>) -> String {
+    match handle.join() {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            log_line("reader-err", &format!("failed to read stream: {}", err));
+            String::new()
+        }
+        Err(_) => {
+            log_line("reader-err", "failed to join stream thread");
+            String::new()
+        }
+    }
 }
 
 fn main() -> Result<()> {
