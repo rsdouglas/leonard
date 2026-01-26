@@ -6,8 +6,6 @@ use std::process::{Command, Stdio};
 use std::thread;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-mod tui;
-
 #[derive(Parser, Debug)]
 #[command(name = "leonard")]
 #[command(about = "Relay text between Maker and Critic agents")]
@@ -16,9 +14,9 @@ struct Args {
     #[arg(long)]
     cwd: Option<PathBuf>,
 
-    /// Overarching task to give the maker (omit for interactive TUI mode)
+    /// Overarching task to give the maker
     #[arg(long)]
-    task: Option<String>,
+    task: String,
 
     /// Maximum number of relay turns (0 = unlimited)
     #[arg(long, default_value_t = 10)]
@@ -113,7 +111,7 @@ fn run_maker(
 }
 
 /// Build the critic meta-prompt that frames the review context
-fn build_critic_prompt(task: &str, maker_output: &str, is_continuation: bool) -> String {
+fn build_critic_prompt(_task: &str, maker_output: &str, _is_continuation: bool) -> String {
     return maker_output.to_string();
 }
 //     if is_continuation {
@@ -365,23 +363,5 @@ fn join_reader(handle: thread::JoinHandle<Result<String>>) -> String {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-
-    match &args.task {
-        Some(task) => {
-            // Batch mode with provided task
-            run_batch(&args, task)
-        }
-        None => {
-            // Interactive TUI mode
-            tui::run_tui(
-                args.cwd,
-                None,
-                args.max_turns,
-                args.strip_ansi,
-                args.max_forward_bytes,
-                args.r#continue,
-                args.log_file,
-            )
-        }
-    }
+    run_batch(&args, &args.task)
 }
