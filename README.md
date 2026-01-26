@@ -1,13 +1,13 @@
 # Leonard
 
-Leonard is a maker/critic orchestrator that coordinates two AI coding agents in a collaborative loop: a **Maker** (Claude Code) that writes code, and a **Critic** (Codex) that reviews it. Leonard runs each agent as a subprocess, parses their JSON output to extract text, and forwards it between them in a turn-based cycle.
+Leonard is an AI agent pair-programming orchestrator that coordinates two coding agents in a collaborative loop: a **Maker** (Claude Code) that writes code, and an **Assistant** (Codex) that reviews and provides guidance. Leonard runs each agent as a subprocess, parses their JSON output to extract text, and forwards it between them in a turn-based cycle.
 
 ## Architecture
 
-Leonard implements a simple relay pattern:
+Leonard implements a simple relay pattern for AI pair-programming:
 
 1. **Maker** receives a task and produces code changes
-2. **Critic** reviews the Maker's output and provides feedback
+2. **Assistant** reviews the Maker's output and provides feedback
 3. **Maker** receives the feedback via `--continue` and iterates
 4. Repeat until `--max-turns` reached
 
@@ -15,8 +15,8 @@ Leonard implements a simple relay pattern:
 ┌─────────────────────────────────────────────────────────────┐
 │                        Leonard                              │
 │                                                             │
-│  Task → Maker (claude) → Critic (codex) → Maker → ...      │
-│         └─ writes code    └─ reviews      └─ iterates       │
+│  Task → Maker (claude) → Assistant (codex) → Maker → ...   │
+│         └─ writes code    └─ reviews/guides   └─ iterates   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -25,12 +25,12 @@ Leonard implements a simple relay pattern:
 Leonard requires these external CLI tools in your `PATH`:
 
 1. **`claude` CLI** - Anthropic's Claude Code CLI tool
-   - Used as the Maker agent
+   - Used as the Maker agent (writes code)
    - Must support `-p`, `--continue`, `--permission-mode`, `--output-format stream-json`
    - Requires `ANTHROPIC_API_KEY` environment variable
 
 2. **`codex` CLI** - OpenAI Codex CLI tool
-   - Used as the Critic agent
+   - Used as the Assistant agent (reviews and guides)
    - Must support `exec`, `--sandbox read-only`, `--json`
    - Requires `OPENAI_API_KEY` environment variable
 
@@ -91,7 +91,7 @@ Run Leonard on a codebase with a specific task:
 # Set environment variables
 source .envrc
 
-# Run a 3-turn maker/critic loop
+# Run a 3-turn pair-programming loop
 cargo run -- \
   --cwd /path/to/your/project \
   --task "Refactor the database connection code to use connection pooling" \
@@ -103,11 +103,13 @@ For testing without waiting, use background execution (see CLAUDE.md).
 ## How It Works
 
 1. **Maker turn**: Leonard spawns `claude -p` with the task, captures stdout and parses JSON events to extract text
-2. **Critic turn**: Extracted Maker text is forwarded to `codex exec --sandbox read-only` (first turn) or `codex resume --last` (continuation)
-3. **Maker continuation**: Critic feedback is parsed from JSONL and sent to `claude -p --continue`
+2. **Assistant turn**: Extracted Maker text is forwarded to `codex exec --sandbox read-only` (first turn) or `codex resume --last` (continuation)
+3. **Maker continuation**: Assistant feedback is parsed from JSONL and sent to `claude -p --continue`
 4. **Repeat**: Steps 2-3 repeat until max-turns reached or interrupted
 
 Output is streamed to stdout with section headers (`=== MAKER ===`, `=== CRITIC (turn N) ===`). Logs with timestamps go to stderr.
+
+**Note on terminology**: Leonard conceptually frames the second agent as an "Assistant" (reflecting the pair-programming guidance role), but the CLI output and code internals use "CRITIC" as the technical term.
 
 ## Architecture Notes
 
