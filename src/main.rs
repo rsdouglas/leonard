@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
+use colored::{ColoredString, Colorize};
 use serde::Deserialize;
-use std::io::Write as _;
+use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
 use std::process::Stdio;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -86,7 +87,7 @@ struct Args {
 
     /// Overarching task to give the maker
     #[arg(long)]
-    task: String,
+    task: Option<String>,
 
     /// Maximum number of relay turns (0 = unlimited)
     #[arg(long, default_value_t = 10)]
@@ -123,6 +124,32 @@ fn log_line(tag: &str, msg: &str) {
 pub fn strip_ansi(input: &str) -> String {
     let bytes = strip_ansi_escapes::strip(input);
     String::from_utf8_lossy(&bytes).to_string()
+}
+
+fn should_use_colors() -> bool {
+    // Respect NO_COLOR environment variable
+    if std::env::var("NO_COLOR").is_ok() {
+        return false;
+    }
+
+    // Check for dumb terminal
+    if let Ok(term) = std::env::var("TERM") {
+        if term == "dumb" {
+            return false;
+        }
+    }
+
+    // Check if stdout is a TTY
+    std::io::stdout().is_terminal()
+}
+
+fn maybe_color<S: Into<String>>(s: S, color_fn: impl Fn(String) -> ColoredString) -> String {
+    let text = s.into();
+    if should_use_colors() {
+        color_fn(text).to_string()
+    } else {
+        text
+    }
 }
 
 fn truncate_line(s: &str, max_chars: usize) -> String {
@@ -219,7 +246,6 @@ async fn run_maker(
         cmd.current_dir(dir);
     }
 
-    cmd.env("TERM", "xterm-256color");
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         cmd.env("ANTHROPIC_API_KEY", key);
     }
@@ -263,11 +289,11 @@ async fn run_maker(
                                     for block in message.content {
                                         match block {
                                             ContentBlock::Text { text } => {
-                                                println!("{}", text);
+                                                println!("{}", maybe_color(text.clone(), |s| s.cyan()));
                                                 collected.push(text);
                                             }
                                             ContentBlock::ToolUse { name } => {
-                                                print!("  [{}] ", name);
+                                                print!("{}", maybe_color(format!("  [{}] ", name), |s| s.bright_cyan()));
                                                 let _ = out.flush();
                                             }
                                             _ => {}
@@ -278,7 +304,7 @@ async fn run_maker(
                                     for block in message.content {
                                         if let ContentBlock::ToolResult { content } = block {
                                             let summary = summarize_tool_result(&content);
-                                            println!("{}", summary);
+                                            println!("{}", maybe_color(format!("  -> {}", summary), |s| s.cyan().dimmed()));
                                             collected.push(format!("  -> {}", summary));
                                         }
                                     }
@@ -306,8 +332,23 @@ async fn run_maker(
     Ok(collected.join("\n"))
 }
 
+/// Build the initial maker prompt from task and/or context
+fn build_maker_prompt(task: Option<&str>, context: Option<&str>) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(t) = task {
+        parts.push(format!("## Task\n{}", t));
+    }
+
+    if let Some(c) = context {
+        parts.push(format!("## Context\n{}", c));
+    }
+
+    parts.join("\n\n")
+}
+
 /// Build the critic meta-prompt that frames the review context
-fn build_critic_prompt(task: &str, maker_output: &str, is_continuation: bool) -> String {
+fn build_critic_prompt(task: Option<&str>, context: Option<&str>, maker_output: &str, is_continuation: bool) -> String {
     if is_continuation {
         format!(
             r#"The maker has responded:
@@ -321,17 +362,26 @@ Review this response. If the task is complete, respond with "ALL_DONE".
             maker_output = maker_output
         )
     } else {
-        format!(
+        let mut prompt = String::from(
             r#"ROLE: Helpful Peer
 You are acting as a helpful peer. Your job is to evaluate the maker's work for the task below.
-Do not offer to do things. Discuss, comment, and guide the maker. 
+Do not offer to do things. Discuss, comment, and guide the maker.
 Your job is not to block the maker, but to help them make progress and point out things they may have missed.
 Progress is the goal, not perfection. We work iteratively, so we can improve incrementally.
 
-## Original Task
-{task}
+"#
+        );
 
-## Maker's Output
+        if let Some(t) = task {
+            prompt.push_str(&format!("## Original Task\n{}\n\n", t));
+        }
+
+        if let Some(c) = context {
+            prompt.push_str(&format!("## Context\n{}\n\n", c));
+        }
+
+        prompt.push_str(&format!(
+            r#"## Maker's Output
 
 ---
 {maker_output}
@@ -339,9 +389,10 @@ Progress is the goal, not perfection. We work iteratively, so we can improve inc
 
 If the task is complete, you can end the conversation with "ALL_DONE".
 "#,
-            task = task,
             maker_output = maker_output
-        )
+        ));
+
+        prompt
     }
 }
 
@@ -376,7 +427,6 @@ async fn run_critic(
         cmd.current_dir(dir);
     }
 
-    cmd.env("TERM", "xterm-256color");
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         cmd.env("OPENAI_API_KEY", key);
     }
@@ -421,7 +471,7 @@ async fn run_critic(
                                         if let Some(t) = text {
                                             if !t.is_empty() {
                                                 for l in t.lines() {
-                                                    println!("  thinking: {}", truncate_line(l, 80));
+                                                    println!("{}", maybe_color(format!("  thinking: {}", truncate_line(l, 80)), |s| s.magenta().dimmed()));
                                                 }
                                             }
                                         }
@@ -429,7 +479,7 @@ async fn run_critic(
                                     CodexItem::AgentMessage { text } => {
                                         if let Some(t) = text {
                                             if !t.is_empty() {
-                                                println!("{}", t);
+                                                println!("{}", maybe_color(t.clone(), |s| s.magenta()));
                                                 collected.push(t);
                                             }
                                         }
@@ -440,13 +490,19 @@ async fn run_critic(
                                             let summary = summarize_command_output(&output);
                                             let exit = exit_code.unwrap_or(0);
                                             if summary.is_empty() {
-                                                println!("  [exit {}] {}", exit, truncate_line(&cmd_str, 60));
+                                                println!("{}", maybe_color(format!("  [exit {}] {}", exit, truncate_line(&cmd_str, 60)), |s| s.bright_magenta()));
                                             } else {
                                                 println!(
-                                                    "  [exit {}] {} -> {}",
-                                                    exit,
-                                                    truncate_line(&cmd_str, 40),
-                                                    truncate_line(&summary, 30)
+                                                    "{}",
+                                                    maybe_color(
+                                                        format!(
+                                                            "  [exit {}] {} -> {}",
+                                                            exit,
+                                                            truncate_line(&cmd_str, 40),
+                                                            truncate_line(&summary, 30)
+                                                        ),
+                                                        |s| s.bright_magenta()
+                                                    )
                                                 );
                                             }
                                             let _ = out.flush();
@@ -490,11 +546,18 @@ pub fn truncate(text: &str, max_bytes: usize) -> String {
     }
 }
 
-async fn run_batch(args: &Args, task: &str) -> Result<()> {
-    log_line("system", &format!("task: {}", task));
+async fn run_batch(args: &Args, task: Option<&str>, context: Option<&str>) -> Result<()> {
+    if let Some(t) = task {
+        log_line("system", &format!("task: {}", t));
+    }
+    if let Some(c) = context {
+        log_line("system", &format!("context: {} chars", c.chars().count()));
+    }
 
-    println!("=== MAKER ===");
-    let mut maker_output = run_maker(&args.cwd, task, args.r#continue).await?;
+    let maker_prompt = build_maker_prompt(task, context);
+
+    println!("{}", maybe_color("=== MAKER ===", |s| s.cyan().bold()));
+    let mut maker_output = run_maker(&args.cwd, &maker_prompt, args.r#continue).await?;
     println!();
 
     if args.strip_ansi {
@@ -509,9 +572,9 @@ async fn run_batch(args: &Args, task: &str) -> Result<()> {
         let critic_is_continuation = turn > 0 || args.r#continue;
 
         let truncated_maker = truncate(&maker_output, args.max_forward_bytes);
-        let critic_prompt = build_critic_prompt(task, &truncated_maker, critic_is_continuation);
+        let critic_prompt = build_critic_prompt(task, context, &truncated_maker, critic_is_continuation);
 
-        println!("=== CRITIC (turn {}) ===", turn);
+        println!("{}", maybe_color(format!("=== CRITIC (turn {}) ===", turn), |s| s.magenta().bold()));
         let mut critic_output = run_critic(&args.cwd, &critic_prompt, critic_is_continuation).await?;
         println!();
 
@@ -528,7 +591,7 @@ async fn run_batch(args: &Args, task: &str) -> Result<()> {
 
         let feedback = truncate(&critic_output, args.max_forward_bytes);
 
-        println!("=== MAKER (turn {}) ===", turn + 1);
+        println!("{}", maybe_color(format!("=== MAKER (turn {}) ===", turn + 1), |s| s.cyan().bold()));
         maker_output = run_maker(&args.cwd, &feedback, true).await?;
         println!();
 
@@ -559,5 +622,37 @@ fn critic_signaled_done(output: &str) -> bool {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    run_batch(&args, &args.task).await
+
+    // Read leonard.md if present in cwd
+    let leonard_path = if let Some(ref dir) = args.cwd {
+        dir.join("leonard.md")
+    } else {
+        PathBuf::from("leonard.md")
+    };
+
+    let context = if leonard_path.exists() {
+        match std::fs::read_to_string(&leonard_path) {
+            Ok(content) if !content.trim().is_empty() => Some(content),
+            Ok(_) => None, // Empty/whitespace-only
+            Err(e) => {
+                log_line("system", &format!("warning: failed to read leonard.md: {}", e));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Normalize empty/whitespace task to None
+    let task = args.task.as_deref().and_then(|t| {
+        let trimmed = t.trim();
+        if trimmed.is_empty() { None } else { Some(trimmed) }
+    });
+
+    // Validate we have at least one input
+    if task.is_none() && context.is_none() {
+        anyhow::bail!("Either --task or leonard.md must be provided");
+    }
+
+    run_batch(&args, task, context.as_deref()).await
 }
