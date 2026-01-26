@@ -59,10 +59,10 @@ claude -p --permission-mode acceptEdits [--continue] "<prompt>"
 
 **Critic** (Codex exec):
 ```
-codex exec --full-auto [-C <dir>] "<prompt>"
+codex exec --read-only [-C <dir>] "<prompt>"
 ```
 - `exec`: one-shot execution mode
-- `--full-auto`: auto-approve all actions
+- `--read-only`: allow reads but block writes
 - `-C <dir>`: passed when `--cwd` is specified
 - `TERM=xterm-256color` is set in the environment
 
