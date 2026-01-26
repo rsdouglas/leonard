@@ -1,22 +1,22 @@
 # Leonard
 
-Leonard is an AI agent pair-programming orchestrator that coordinates two coding agents in a collaborative loop: a **Maker** (Claude Code) that writes code, and an **Assistant** (Codex) that reviews and provides guidance. Leonard runs each agent as a subprocess, parses their JSON output to extract text, and forwards it between them in a turn-based cycle.
+Leonard is an AI agent pair-programming orchestrator that coordinates two coding agents in a collaborative loop: a **Driver** (Claude Code) that writes code, and a **Navigator** (Codex) that reviews and provides guidance. Leonard runs each agent as a subprocess, parses their JSON output to extract text, and forwards it between them in a turn-based cycle.
 
 ## Architecture
 
 Leonard implements a simple relay pattern for AI pair-programming:
 
-1. **Maker** receives a task and produces code changes
-2. **Assistant** reviews the Maker's output and provides feedback
-3. **Maker** receives the feedback via `--continue` and iterates
+1. **Driver** receives a task and produces code changes
+2. **Navigator** reviews the Driver's output and provides feedback
+3. **Driver** receives the feedback via `--continue` and iterates
 4. Repeat until `--max-turns` reached
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        Leonard                              │
 │                                                             │
-│  Task → Maker (claude) → Assistant (codex) → Maker → ...   │
-│         └─ writes code    └─ reviews/guides   └─ iterates   │
+│  Task → Driver (claude) → Navigator (codex) → Driver → ...  │
+│         └─ writes code     └─ reviews/guides  └─ iterates   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -25,12 +25,12 @@ Leonard implements a simple relay pattern for AI pair-programming:
 Leonard requires these external CLI tools in your `PATH`:
 
 1. **`claude` CLI** - Anthropic's Claude Code CLI tool
-   - Used as the Maker agent (writes code)
+   - Used as the Driver agent (writes code)
    - Must support `-p`, `--continue`, `--permission-mode`, `--output-format stream-json`
    - Requires `ANTHROPIC_API_KEY` environment variable
 
 2. **`codex` CLI** - OpenAI Codex CLI tool
-   - Used as the Assistant agent (reviews and guides)
+   - Used as the Navigator agent (reviews and guides)
    - Must support `exec`, `--sandbox read-only`, `--json`
    - Requires `OPENAI_API_KEY` environment variable
 
@@ -66,7 +66,7 @@ leonard --cwd /path/to/repo --task "Add error handling to the login function" --
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--cwd <path>` | Working directory for both agents | current directory |
-| `--task <string>` | Initial task prompt for the Maker | (required) |
+| `--task <string>` | Initial task prompt for the Driver | (required) |
 | `--max-turns <n>` | Maximum relay turns (0 = unlimited) | 10 |
 | `--strip-ansi` | Strip ANSI escape codes from output | true |
 | `--max-forward-bytes <n>` | Max bytes forwarded between agents | 100000 |
@@ -76,8 +76,8 @@ leonard --cwd /path/to/repo --task "Add error handling to the login function" --
 ### Environment Variables
 
 Required:
-- `ANTHROPIC_API_KEY` - API key for Claude (Maker)
-- `OPENAI_API_KEY` - API key for Codex (Critic)
+- `ANTHROPIC_API_KEY` - API key for Claude (Driver)
+- `OPENAI_API_KEY` - API key for Codex (Navigator)
 
 Optional:
 - Use `.envrc` with [direnv](https://direnv.net/) for automatic loading
@@ -100,20 +100,48 @@ cargo run -- \
 
 For testing without waiting, use background execution (see CLAUDE.md).
 
+## Per-Repository Context (`leonard.md`)
+
+Leonard automatically loads a `leonard.md` file from `--cwd` if provided, otherwise the current working directory. This file provides context and guidance to both agents about the specific repository they're working in.
+
+Use `leonard.md` to document:
+- Project-specific conventions and patterns
+- Architecture decisions and constraints
+- Testing requirements and procedures
+- Build and deployment instructions
+- Common gotchas or known issues
+- Preferred libraries or approaches for the codebase
+
+The contents of `leonard.md` are included in the initial prompts to both agents, giving them shared context about the project from the start.
+
+**Example** `leonard.md`:
+```markdown
+# Project Context
+
+This is a React + TypeScript project using Vite.
+
+## Conventions
+- Use functional components with hooks, not class components
+- All API calls go through `src/lib/api.ts`
+- Tests use Vitest and React Testing Library
+
+## Before submitting code
+- Run `npm test` to ensure tests pass
+- Run `npm run typecheck` to verify TypeScript
+```
+
 ## How It Works
 
-1. **Maker turn**: Leonard spawns `claude -p` with the task, captures stdout and parses JSON events to extract text
-2. **Assistant turn**: Extracted Maker text is forwarded to `codex exec --sandbox read-only` (first turn) or `codex resume --last` (continuation)
-3. **Maker continuation**: Assistant feedback is parsed from JSONL and sent to `claude -p --continue`
+1. **Driver turn**: Leonard spawns `claude -p` with the task, captures stdout and parses JSON events to extract text
+2. **Navigator turn**: Extracted Driver text is forwarded to `codex exec --sandbox read-only` (first turn) or `codex resume --last` (continuation)
+3. **Driver continuation**: Navigator feedback is parsed from JSONL and sent to `claude -p --continue`
 4. **Repeat**: Steps 2-3 repeat until max-turns reached or interrupted
 
-Output is streamed to stdout with section headers (`=== MAKER ===`, `=== CRITIC (turn N) ===`). Logs with timestamps go to stderr.
-
-**Note on terminology**: Leonard conceptually frames the second agent as an "Assistant" (reflecting the pair-programming guidance role), but the CLI output and code internals use "CRITIC" as the technical term.
+Output is streamed to stdout with section headers (`=== DRIVER ===`, `=== NAVIGATOR (turn N) ===`). Logs with timestamps go to stderr.
 
 ## Architecture Notes
 
-The current implementation uses simple `stdout` pipes (`Stdio::piped()`), not PTYs. Leonard only reads stdout from child processes; stderr is piped but not consumed. The `architecture.md` file originally described a PTY-based design, which may be implemented in the future for better terminal interaction, but the current release uses the simpler pipe-based approach.
+Leonard spawns both agents as child processes and uses `stdout` pipes (`Stdio::piped()`) to capture their output. Stderr is piped but not actively consumed.
 
 ## Contributing
 

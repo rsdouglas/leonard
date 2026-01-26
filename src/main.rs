@@ -79,13 +79,13 @@ enum CodexItem {
 
 #[derive(Parser, Debug)]
 #[command(name = "leonard")]
-#[command(about = "Relay text between Maker and Critic agents")]
+#[command(about = "Relay text between Driver and Navigator agents")]
 struct Args {
     /// Working directory for both agents
     #[arg(long)]
     cwd: Option<PathBuf>,
 
-    /// Overarching task to give the maker
+    /// Overarching task to give the driver
     #[arg(long)]
     task: Option<String>,
 
@@ -101,7 +101,7 @@ struct Args {
     #[arg(long, default_value_t = 100_000)]
     max_forward_bytes: usize,
 
-    /// Resume the previous Claude session (use --continue on first maker call)
+    /// Resume the previous Claude session (use --continue on first driver call)
     #[arg(long, short = 'c')]
     r#continue: bool,
 
@@ -220,13 +220,13 @@ async fn kill_child(child: &mut Child, name: &str) {
 }
 
 /// Run Claude in print mode with JSON streaming and return its output
-async fn run_maker(
+async fn run_driver(
     cwd: &Option<PathBuf>,
     prompt: &str,
     is_continuation: bool,
 ) -> Result<String> {
     if prompt.trim().is_empty() {
-        anyhow::bail!("Cannot run maker with empty prompt");
+        anyhow::bail!("Cannot run driver with empty prompt");
     }
 
     let mut cmd = Command::new("claude");
@@ -256,7 +256,7 @@ async fn run_maker(
 
     let prompt_preview: String = prompt.chars().take(80).collect();
     log_line(
-        "maker",
+        "driver",
         &format!(
             "prompt: {}{}",
             prompt_preview,
@@ -265,7 +265,7 @@ async fn run_maker(
     );
 
     let mut child = cmd.spawn().context("failed to spawn claude")?;
-    let stdout = child.stdout.take().context("missing maker stdout")?;
+    let stdout = child.stdout.take().context("missing driver stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
     let mut collected = Vec::new();
@@ -276,7 +276,7 @@ async fn run_maker(
             biased;
 
             _ = tokio::signal::ctrl_c() => {
-                kill_child(&mut child, "maker").await;
+                kill_child(&mut child, "driver").await;
                 anyhow::bail!("interrupted by user");
             }
 
@@ -315,7 +315,7 @@ async fn run_maker(
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        log_line("maker-err", &format!("read error: {}", e));
+                        log_line("driver-err", &format!("read error: {}", e));
                         break;
                     }
                 }
@@ -326,14 +326,14 @@ async fn run_maker(
     let status = child.wait().await.context("failed to wait for claude")?;
 
     if !status.success() {
-        anyhow::bail!("maker exited with status: {}", status);
+        anyhow::bail!("driver exited with status: {}", status);
     }
 
     Ok(collected.join("\n"))
 }
 
-/// Build the initial maker prompt from task and/or context
-fn build_maker_prompt(task: Option<&str>, context: Option<&str>) -> String {
+/// Build the initial driver prompt from task and/or context
+fn build_driver_prompt(task: Option<&str>, context: Option<&str>) -> String {
     let mut parts = Vec::new();
 
     if let Some(t) = task {
@@ -347,26 +347,26 @@ fn build_maker_prompt(task: Option<&str>, context: Option<&str>) -> String {
     parts.join("\n\n")
 }
 
-/// Build the critic meta-prompt that frames the review context
-fn build_critic_prompt(task: Option<&str>, context: Option<&str>, maker_output: &str, is_continuation: bool) -> String {
+/// Build the navigator meta-prompt that frames the review context
+fn build_navigator_prompt(task: Option<&str>, context: Option<&str>, driver_output: &str, is_continuation: bool) -> String {
     if is_continuation {
         format!(
-            r#"The maker has responded:
+            r#"The driver has responded:
 
 ---
-{maker_output}
+{driver_output}
 ---
 
 Review this response. If the task is complete, respond with "ALL_DONE".
 "#,
-            maker_output = maker_output
+            driver_output = driver_output
         )
     } else {
         let mut prompt = String::from(
             r#"ROLE: Helpful Peer
-You are acting as a helpful peer. Your job is to evaluate the maker's work for the task below.
-Do not offer to do things. Discuss, comment, and guide the maker.
-Your job is not to block the maker, but to help them make progress and point out things they may have missed.
+You are acting as a helpful peer. Your job is to evaluate the driver's work for the task below.
+Do not offer to do things. Discuss, comment, and guide the driver.
+Your job is not to block the driver, but to help them make progress and point out things they may have missed.
 Progress is the goal, not perfection. We work iteratively, so we can improve incrementally.
 
 "#
@@ -381,15 +381,15 @@ Progress is the goal, not perfection. We work iteratively, so we can improve inc
         }
 
         prompt.push_str(&format!(
-            r#"## Maker's Output
+            r#"## Driver's Output
 
 ---
-{maker_output}
+{driver_output}
 ---
 
 If the task is complete, you can end the conversation with "ALL_DONE".
 "#,
-            maker_output = maker_output
+            driver_output = driver_output
         ));
 
         prompt
@@ -397,13 +397,13 @@ If the task is complete, you can end the conversation with "ALL_DONE".
 }
 
 /// Run Codex exec with JSON mode and return its output (read-only sandbox)
-async fn run_critic(
+async fn run_navigator(
     cwd: &Option<PathBuf>,
     prompt: &str,
     is_continuation: bool,
 ) -> Result<String> {
     if prompt.trim().is_empty() {
-        anyhow::bail!("Cannot run critic with empty prompt");
+        anyhow::bail!("Cannot run navigator with empty prompt");
     }
 
     let mut cmd = Command::new("codex");
@@ -437,7 +437,7 @@ async fn run_critic(
 
     let prompt_preview: String = prompt.chars().take(80).collect();
     log_line(
-        "critic",
+        "navigator",
         &format!(
             "prompt: {}{}",
             prompt_preview,
@@ -446,7 +446,7 @@ async fn run_critic(
     );
 
     let mut child = cmd.spawn().context("failed to spawn codex")?;
-    let stdout = child.stdout.take().context("missing critic stdout")?;
+    let stdout = child.stdout.take().context("missing navigator stdout")?;
     let mut reader = BufReader::new(stdout).lines();
 
     let mut collected = Vec::new();
@@ -457,7 +457,7 @@ async fn run_critic(
             biased;
 
             _ = tokio::signal::ctrl_c() => {
-                kill_child(&mut child, "critic").await;
+                kill_child(&mut child, "navigator").await;
                 anyhow::bail!("interrupted by user");
             }
 
@@ -515,7 +515,7 @@ async fn run_critic(
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        log_line("critic-err", &format!("read error: {}", e));
+                        log_line("navigator-err", &format!("read error: {}", e));
                         break;
                     }
                 }
@@ -526,7 +526,7 @@ async fn run_critic(
     let status = child.wait().await.context("failed to wait for codex")?;
 
     if !status.success() {
-        anyhow::bail!("critic exited with status: {}", status);
+        anyhow::bail!("navigator exited with status: {}", status);
     }
 
     Ok(collected.join("\n"))
@@ -554,52 +554,52 @@ async fn run_batch(args: &Args, task: Option<&str>, context: Option<&str>) -> Re
         log_line("system", &format!("context: {} chars", c.chars().count()));
     }
 
-    let maker_prompt = build_maker_prompt(task, context);
+    let driver_prompt = build_driver_prompt(task, context);
 
-    println!("{}", maybe_color("=== MAKER ===", |s| s.cyan().bold()));
-    let mut maker_output = run_maker(&args.cwd, &maker_prompt, args.r#continue).await?;
+    println!("{}", maybe_color("=== DRIVER ===", |s| s.cyan().bold()));
+    let mut driver_output = run_driver(&args.cwd, &driver_prompt, args.r#continue).await?;
     println!();
 
     if args.strip_ansi {
-        maker_output = strip_ansi(&maker_output);
+        driver_output = strip_ansi(&driver_output);
     }
 
-    log_line("maker-out", &format!("{} bytes", maker_output.len()));
+    log_line("driver-out", &format!("{} bytes", driver_output.len()));
 
     let mut turn = 0;
 
     loop {
-        let critic_is_continuation = turn > 0 || args.r#continue;
+        let navigator_is_continuation = turn > 0 || args.r#continue;
 
-        let truncated_maker = truncate(&maker_output, args.max_forward_bytes);
-        let critic_prompt = build_critic_prompt(task, context, &truncated_maker, critic_is_continuation);
+        let truncated_driver = truncate(&driver_output, args.max_forward_bytes);
+        let navigator_prompt = build_navigator_prompt(task, context, &truncated_driver, navigator_is_continuation);
 
-        println!("{}", maybe_color(format!("=== CRITIC (turn {}) ===", turn), |s| s.magenta().bold()));
-        let mut critic_output = run_critic(&args.cwd, &critic_prompt, critic_is_continuation).await?;
+        println!("{}", maybe_color(format!("=== NAVIGATOR (turn {}) ===", turn), |s| s.magenta().bold()));
+        let mut navigator_output = run_navigator(&args.cwd, &navigator_prompt, navigator_is_continuation).await?;
         println!();
 
         if args.strip_ansi {
-            critic_output = strip_ansi(&critic_output);
+            navigator_output = strip_ansi(&navigator_output);
         }
 
-        log_line("critic-out", &format!("{} bytes", critic_output.len()));
+        log_line("navigator-out", &format!("{} bytes", navigator_output.len()));
 
-        if critic_signaled_done(&critic_output) {
-            log_line("system", "critic signaled ALL_DONE; ending loop");
+        if navigator_signaled_done(&navigator_output) {
+            log_line("system", "navigator signaled ALL_DONE; ending loop");
             break;
         }
 
-        let feedback = truncate(&critic_output, args.max_forward_bytes);
+        let feedback = truncate(&navigator_output, args.max_forward_bytes);
 
-        println!("{}", maybe_color(format!("=== MAKER (turn {}) ===", turn + 1), |s| s.cyan().bold()));
-        maker_output = run_maker(&args.cwd, &feedback, true).await?;
+        println!("{}", maybe_color(format!("=== DRIVER (turn {}) ===", turn + 1), |s| s.cyan().bold()));
+        driver_output = run_driver(&args.cwd, &feedback, true).await?;
         println!();
 
         if args.strip_ansi {
-            maker_output = strip_ansi(&maker_output);
+            driver_output = strip_ansi(&driver_output);
         }
 
-        log_line("maker-out", &format!("{} bytes", maker_output.len()));
+        log_line("driver-out", &format!("{} bytes", driver_output.len()));
 
         turn += 1;
 
@@ -614,7 +614,7 @@ async fn run_batch(args: &Args, task: Option<&str>, context: Option<&str>) -> Re
     Ok(())
 }
 
-fn critic_signaled_done(output: &str) -> bool {
+fn navigator_signaled_done(output: &str) -> bool {
     let trimmed = output.trim();
     trimmed == "ALL_DONE" || trimmed.to_uppercase() == "ALL_DONE"
 }
