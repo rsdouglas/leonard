@@ -1,10 +1,80 @@
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use serde::Deserialize;
+use std::io::Write as _;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::thread;
+use std::process::Stdio;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, Command};
+
+/// Claude stream-json event types
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+enum ClaudeEvent {
+    #[serde(rename = "assistant")]
+    Assistant { message: AssistantMessage },
+    #[serde(rename = "user")]
+    User { message: UserMessage },
+    #[serde(rename = "result")]
+    Result {
+        #[allow(dead_code)]
+        result: String,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+struct AssistantMessage {
+    content: Vec<ContentBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UserMessage {
+    content: Vec<ContentBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+enum ContentBlock {
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse { name: String },
+    #[serde(rename = "tool_result")]
+    ToolResult { content: Option<serde_json::Value> },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Codex JSONL event types
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum CodexEvent {
+    #[serde(rename = "item.completed")]
+    ItemCompleted { item: CodexItem },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum CodexItem {
+    #[serde(rename = "reasoning")]
+    Reasoning { text: Option<String> },
+    #[serde(rename = "agent_message")]
+    AgentMessage { text: Option<String> },
+    #[serde(rename = "command_execution")]
+    CommandExecution {
+        command: Option<String>,
+        exit_code: Option<i32>,
+        output: Option<String>,
+    },
+    #[serde(other)]
+    Unknown,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "leonard")]
@@ -55,15 +125,87 @@ pub fn strip_ansi(input: &str) -> String {
     String::from_utf8_lossy(&bytes).to_string()
 }
 
-/// Run Claude in print mode and return its output
-fn run_maker(
+fn truncate_line(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_chars).collect();
+        format!("{}...", truncated)
+    }
+}
+
+fn summarize_tool_result(content: &Option<serde_json::Value>) -> String {
+    match content {
+        None => "done".to_string(),
+        Some(serde_json::Value::String(s)) => {
+            let lines: Vec<&str> = s.lines().collect();
+            if lines.len() <= 3 {
+                truncate_line(s, 100)
+            } else {
+                format!("{} lines", lines.len())
+            }
+        }
+        Some(serde_json::Value::Array(arr)) => {
+            let mut text_parts = Vec::new();
+            for item in arr {
+                if let Some(obj) = item.as_object() {
+                    if obj.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
+                            text_parts.push(text);
+                        }
+                    }
+                }
+            }
+            if !text_parts.is_empty() {
+                let combined = text_parts.join(" ");
+                let lines: Vec<&str> = combined.lines().collect();
+                if lines.len() <= 3 {
+                    truncate_line(&combined, 100)
+                } else {
+                    format!("{} lines", lines.len())
+                }
+            } else {
+                format!("{} items", arr.len())
+            }
+        }
+        Some(v) => truncate_line(&v.to_string(), 50),
+    }
+}
+
+fn summarize_command_output(output: &Option<String>) -> String {
+    match output {
+        None => String::new(),
+        Some(s) => {
+            let lines: Vec<&str> = s.lines().collect();
+            if lines.len() <= 3 {
+                truncate_line(s, 100)
+            } else {
+                format!("{} lines", lines.len())
+            }
+        }
+    }
+}
+
+/// Kill child process and wait for it to exit
+async fn kill_child(child: &mut Child, name: &str) {
+    log_line("system", &format!("killing {} process", name));
+    let _ = child.kill().await;
+}
+
+/// Run Claude in print mode with JSON streaming and return its output
+async fn run_maker(
     cwd: &Option<PathBuf>,
     prompt: &str,
     is_continuation: bool,
-    stream_strip_ansi: bool,
 ) -> Result<String> {
+    if prompt.trim().is_empty() {
+        anyhow::bail!("Cannot run maker with empty prompt");
+    }
+
     let mut cmd = Command::new("claude");
     cmd.arg("-p");
+    cmd.arg("--verbose");
+    cmd.arg("--output-format").arg("stream-json");
     cmd.arg("--dangerously-skip-permissions");
     cmd.arg("--permission-mode").arg("acceptEdits");
 
@@ -84,85 +226,146 @@ fn run_maker(
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let prompt_preview: String = prompt.chars().take(80).collect();
-    log_line("maker", &format!("prompt: {}{}",
-        prompt_preview,
-        if prompt.chars().count() > 80 { "..." } else { "" }));
+    log_line(
+        "maker",
+        &format!(
+            "prompt: {}{}",
+            prompt_preview,
+            if prompt.chars().count() > 80 { "..." } else { "" }
+        ),
+    );
 
     let mut child = cmd.spawn().context("failed to spawn claude")?;
     let stdout = child.stdout.take().context("missing maker stdout")?;
-    let stderr = child.stderr.take().context("missing maker stderr")?;
+    let mut reader = BufReader::new(stdout).lines();
 
-    let stderr_handle = thread::spawn(move || read_to_string(stderr));
-    let stdout = stream_and_collect(stdout, stream_strip_ansi)?;
-    let status = child.wait().context("failed to wait for claude")?;
-    let stderr = join_reader(stderr_handle);
+    let mut collected = Vec::new();
+    let mut out = std::io::stdout();
 
-    if !stderr.is_empty() && !stderr.contains("Shell cwd was reset") {
-        log_line("maker-err", &stderr);
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = tokio::signal::ctrl_c() => {
+                kill_child(&mut child, "maker").await;
+                anyhow::bail!("interrupted by user");
+            }
+
+            line = reader.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        if let Ok(event) = serde_json::from_str::<ClaudeEvent>(&line) {
+                            match event {
+                                ClaudeEvent::Assistant { message } => {
+                                    for block in message.content {
+                                        match block {
+                                            ContentBlock::Text { text } => {
+                                                println!("{}", text);
+                                                collected.push(text);
+                                            }
+                                            ContentBlock::ToolUse { name } => {
+                                                print!("  [{}] ", name);
+                                                let _ = out.flush();
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                ClaudeEvent::User { message } => {
+                                    for block in message.content {
+                                        if let ContentBlock::ToolResult { content } = block {
+                                            let summary = summarize_tool_result(&content);
+                                            println!("{}", summary);
+                                            collected.push(format!("  -> {}", summary));
+                                        }
+                                    }
+                                }
+                                ClaudeEvent::Result { .. } | ClaudeEvent::Unknown => {}
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        log_line("maker-err", &format!("read error: {}", e));
+                        break;
+                    }
+                }
+            }
+        }
     }
+
+    let status = child.wait().await.context("failed to wait for claude")?;
 
     if !status.success() {
         anyhow::bail!("maker exited with status: {}", status);
     }
 
-    Ok(stdout)
+    Ok(collected.join("\n"))
 }
 
 /// Build the critic meta-prompt that frames the review context
-fn build_critic_prompt(_task: &str, maker_output: &str, _is_continuation: bool) -> String {
-    return maker_output.to_string();
+fn build_critic_prompt(task: &str, maker_output: &str, is_continuation: bool) -> String {
+    if is_continuation {
+        format!(
+            r#"The maker has responded:
+
+---
+{maker_output}
+---
+
+Review this response. If the task is complete, respond with "ALL_DONE".
+"#,
+            maker_output = maker_output
+        )
+    } else {
+        format!(
+            r#"ROLE: Helpful Peer
+You are acting as a helpful peer. Your job is to evaluate the maker's work for the task below.
+Do not offer to do things. Discuss, comment, and guide the maker. 
+Your job is not to block the maker, but to help them make progress and point out things they may have missed.
+Progress is the goal, not perfection. We work iteratively, so we can improve incrementally.
+
+## Original Task
+{task}
+
+## Maker's Output
+
+---
+{maker_output}
+---
+
+If the task is complete, you can end the conversation with "ALL_DONE".
+"#,
+            task = task,
+            maker_output = maker_output
+        )
+    }
 }
-//     if is_continuation {
-//         // On continuation, critic already has context - just send new output
-//         format!(
-//             r#"The maker has responded:
 
-// ---
-// {maker_output}
-// ---
-// "#,
-//             maker_output = maker_output
-//         )
-//     } else {
-//         // First call - full framing
-//         format!(
-//             r#"ROLE: Helpful Peer
-// You are acting as a helpful peer. Your job is to evaluate the maker's work for the task below.
-// Do not offer to do things. Discuss, comment, and guide the maker. 
-// Be friendly and helpful, not an overly harsh critic.
-// Your job is not to block the maker, but to help them make progress and point out things they may have missed.
-// Progress is the goal, not perfection. We work iteratively, so we can improve incrementally.
+/// Run Codex exec with JSON mode and return its output (read-only sandbox)
+async fn run_critic(
+    cwd: &Option<PathBuf>,
+    prompt: &str,
+    is_continuation: bool,
+) -> Result<String> {
+    if prompt.trim().is_empty() {
+        anyhow::bail!("Cannot run critic with empty prompt");
+    }
 
-// ## Original Task
-// {task}
-
-// ## Maker's Output
-
-// ---
-// {maker_output}
-// ---
-
-// If the task is complete, you can end the conversation with "ALL_DONE".
-// "#,
-//             task = task,
-//             maker_output = maker_output
-//         )
-//     }
-// }
-
-/// Run Codex exec and return its output (read-only sandbox)
-fn run_critic(cwd: &Option<PathBuf>, prompt: &str, is_continuation: bool, stream_strip_ansi: bool) -> Result<String> {
     let mut cmd = Command::new("codex");
     cmd.arg("exec");
 
     if is_continuation {
         cmd.arg("resume");
         cmd.arg("--last");
+        cmd.arg("--json");
         cmd.arg(prompt);
     } else {
         cmd.arg("--sandbox").arg("read-only");
+        cmd.arg("--json");
         if let Some(dir) = cwd {
             cmd.arg("-C").arg(dir);
         }
@@ -180,37 +383,103 @@ fn run_critic(cwd: &Option<PathBuf>, prompt: &str, is_continuation: bool, stream
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
 
     let prompt_preview: String = prompt.chars().take(80).collect();
-    log_line("critic", &format!("prompt: {}{}",
-        prompt_preview,
-        if prompt.chars().count() > 80 { "..." } else { "" }));
+    log_line(
+        "critic",
+        &format!(
+            "prompt: {}{}",
+            prompt_preview,
+            if prompt.chars().count() > 80 { "..." } else { "" }
+        ),
+    );
 
     let mut child = cmd.spawn().context("failed to spawn codex")?;
     let stdout = child.stdout.take().context("missing critic stdout")?;
-    let stderr = child.stderr.take().context("missing critic stderr")?;
+    let mut reader = BufReader::new(stdout).lines();
 
-    let stderr_handle = thread::spawn(move || read_to_string(stderr));
-    let stdout = stream_and_collect(stdout, stream_strip_ansi)?;
-    let status = child.wait().context("failed to wait for codex")?;
-    let stderr = join_reader(stderr_handle);
+    let mut collected = Vec::new();
+    let mut out = std::io::stdout();
 
-    if !stderr.is_empty() {
-        log_line("critic-err", &stderr);
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = tokio::signal::ctrl_c() => {
+                kill_child(&mut child, "critic").await;
+                anyhow::bail!("interrupted by user");
+            }
+
+            line = reader.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        if let Ok(event) = serde_json::from_str::<CodexEvent>(&line) {
+                            if let CodexEvent::ItemCompleted { item } = event {
+                                match item {
+                                    CodexItem::Reasoning { text } => {
+                                        if let Some(t) = text {
+                                            if !t.is_empty() {
+                                                for l in t.lines() {
+                                                    println!("  thinking: {}", truncate_line(l, 80));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    CodexItem::AgentMessage { text } => {
+                                        if let Some(t) = text {
+                                            if !t.is_empty() {
+                                                println!("{}", t);
+                                                collected.push(t);
+                                            }
+                                        }
+                                    }
+                                    CodexItem::CommandExecution { command, exit_code, output } => {
+                                        let cmd_str = command.unwrap_or_default();
+                                        if !cmd_str.is_empty() {
+                                            let summary = summarize_command_output(&output);
+                                            let exit = exit_code.unwrap_or(0);
+                                            if summary.is_empty() {
+                                                println!("  [exit {}] {}", exit, truncate_line(&cmd_str, 60));
+                                            } else {
+                                                println!(
+                                                    "  [exit {}] {} -> {}",
+                                                    exit,
+                                                    truncate_line(&cmd_str, 40),
+                                                    truncate_line(&summary, 30)
+                                                );
+                                            }
+                                            let _ = out.flush();
+                                        }
+                                    }
+                                    CodexItem::Unknown => {}
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        log_line("critic-err", &format!("read error: {}", e));
+                        break;
+                    }
+                }
+            }
+        }
     }
+
+    let status = child.wait().await.context("failed to wait for codex")?;
 
     if !status.success() {
         anyhow::bail!("critic exited with status: {}", status);
     }
 
-    Ok(stdout)
+    Ok(collected.join("\n"))
 }
 
 pub fn truncate(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         text.to_string()
     } else {
-        // Find a valid UTF-8 boundary at or after the target start position
         let target_start = text.len() - max_bytes;
         let start = text
             .char_indices()
@@ -221,12 +490,11 @@ pub fn truncate(text: &str, max_bytes: usize) -> String {
     }
 }
 
-fn run_batch(args: &Args, task: &str) -> Result<()> {
+async fn run_batch(args: &Args, task: &str) -> Result<()> {
     log_line("system", &format!("task: {}", task));
 
-    // First maker turn - just the task (use --continue if resuming previous session)
     println!("=== MAKER ===");
-    let mut maker_output = run_maker(&args.cwd, task, args.r#continue, args.strip_ansi)?;
+    let mut maker_output = run_maker(&args.cwd, task, args.r#continue).await?;
     println!();
 
     if args.strip_ansi {
@@ -238,16 +506,13 @@ fn run_batch(args: &Args, task: &str) -> Result<()> {
     let mut turn = 0;
 
     loop {
-
-        // First critic call (turn 0) uses resume only if --continue was passed
         let critic_is_continuation = turn > 0 || args.r#continue;
 
-        // Build critic prompt with meta-context
         let truncated_maker = truncate(&maker_output, args.max_forward_bytes);
         let critic_prompt = build_critic_prompt(task, &truncated_maker, critic_is_continuation);
 
         println!("=== CRITIC (turn {}) ===", turn);
-        let mut critic_output = run_critic(&args.cwd, &critic_prompt, critic_is_continuation, args.strip_ansi)?;
+        let mut critic_output = run_critic(&args.cwd, &critic_prompt, critic_is_continuation).await?;
         println!();
 
         if args.strip_ansi {
@@ -256,22 +521,15 @@ fn run_batch(args: &Args, task: &str) -> Result<()> {
 
         log_line("critic-out", &format!("{} bytes", critic_output.len()));
 
-        // Debug: show the actual lines for debugging
-        log_line("critic-debug", &format!("Checking for ALL_DONE in {} lines", critic_output.lines().count()));
-        for (idx, line) in critic_output.lines().enumerate().take(20) {
-            log_line("critic-debug", &format!("Line {}: {:?}", idx, line));
-        }
-
         if critic_signaled_done(&critic_output) {
             log_line("system", "critic signaled ALL_DONE; ending loop");
             break;
         }
 
-        // Forward critic output to maker verbatim
         let feedback = truncate(&critic_output, args.max_forward_bytes);
 
         println!("=== MAKER (turn {}) ===", turn + 1);
-        maker_output = run_maker(&args.cwd, &feedback, true, args.strip_ansi)?;
+        maker_output = run_maker(&args.cwd, &feedback, true).await?;
         println!();
 
         if args.strip_ansi {
@@ -294,74 +552,14 @@ fn run_batch(args: &Args, task: &str) -> Result<()> {
 }
 
 fn critic_signaled_done(output: &str) -> bool {
-    // Check each line for ALL_DONE (case-insensitive, allowing for extra whitespace)
     output.lines().any(|line| {
         let trimmed = line.trim();
         trimmed == "ALL_DONE" || trimmed.to_uppercase() == "ALL_DONE"
-    }) || output.contains("ALL_DONE")  // Fallback: check if it appears anywhere
+    }) || output.contains("ALL_DONE")
 }
 
-fn stream_and_collect<R: Read>(reader: R, strip_for_print: bool) -> Result<String> {
-    let mut reader = BufReader::new(reader);
-    let mut stdout = io::stdout();
-    let mut collected = Vec::new();
-    let mut buf = [0u8; 256];
-
-    loop {
-        let bytes_read = reader.read(&mut buf)?;
-        if bytes_read == 0 {
-            break;
-        }
-        let chunk = &buf[..bytes_read];
-        collected.extend_from_slice(chunk);
-
-        // Print as we receive data
-        if strip_for_print {
-            let text = String::from_utf8_lossy(chunk);
-            let stripped = strip_ansi(&text);
-            print!("{}", stripped);
-        } else {
-            // Write raw bytes directly to stdout
-            let _ = stdout.write_all(chunk);
-        }
-        let _ = stdout.flush();
-    }
-
-    Ok(String::from_utf8_lossy(&collected).to_string())
-}
-
-fn read_to_string<R: Read>(reader: R) -> Result<String> {
-    let mut reader = BufReader::new(reader);
-    let mut buf = String::new();
-    let mut collected = String::new();
-
-    loop {
-        buf.clear();
-        let bytes = reader.read_line(&mut buf)?;
-        if bytes == 0 {
-            break;
-        }
-        collected.push_str(&buf);
-    }
-
-    Ok(collected)
-}
-
-fn join_reader(handle: thread::JoinHandle<Result<String>>) -> String {
-    match handle.join() {
-        Ok(Ok(output)) => output,
-        Ok(Err(err)) => {
-            log_line("reader-err", &format!("failed to read stream: {}", err));
-            String::new()
-        }
-        Err(_) => {
-            log_line("reader-err", "failed to join stream thread");
-            String::new()
-        }
-    }
-}
-
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     let args = Args::parse();
-    run_batch(&args, &args.task)
+    run_batch(&args, &args.task).await
 }
