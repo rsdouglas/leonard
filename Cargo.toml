@@ -2,6 +2,11 @@
 name = "leonard"
 version = "0.1.0"
 edition = "2021"
+description = "A maker/critic orchestrator that coordinates Claude Code (maker) and Codex (critic) in a collaborative coding loop"
+license = "MIT"
+authors = ["Leonard Contributors"]
+keywords = ["ai", "coding-agent", "orchestrator", "claude", "codex"]
+categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0"

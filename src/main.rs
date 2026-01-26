@@ -552,10 +552,8 @@ async fn run_batch(args: &Args, task: &str) -> Result<()> {
 }
 
 fn critic_signaled_done(output: &str) -> bool {
-    output.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed == "ALL_DONE" || trimmed.to_uppercase() == "ALL_DONE"
-    }) || output.contains("ALL_DONE")
+    let trimmed = output.trim();
+    trimmed == "ALL_DONE" || trimmed.to_uppercase() == "ALL_DONE"
 }
 
 #[tokio::main(flavor = "current_thread")]
