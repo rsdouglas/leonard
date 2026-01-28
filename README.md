@@ -2,6 +2,32 @@
 
 Leonard is an AI agent pair-programming orchestrator that coordinates two coding agents in a collaborative loop: a **Driver** (Claude Code) that writes code, and a **Navigator** (Codex) that reviews and provides guidance. Leonard runs each agent as a subprocess, parses their JSON output to extract text, and forwards it between them in a turn-based cycle.
 
+## Quick Start (macOS)
+
+For macOS users (if you don't have Homebrew, install it from [brew.sh](https://brew.sh)):
+
+```bash
+# Install rustup-init (Rust toolchain installer)
+brew install rustup-init
+
+# Run the installer to set up Rust (will offer to update your PATH)
+rustup-init
+
+# Load Rust into your PATH if needed (or open a new terminal)
+source "$HOME/.cargo/env"
+
+# Verify installation
+rustc --version
+cargo --version
+
+# Clone and build Leonard
+git clone <repository-url>
+cd leonard
+cargo build --release
+```
+
+You'll also need the `claude` and `codex` CLI tools (see [Prerequisites](#prerequisites) below).
+
 ## Architecture
 
 Leonard implements a simple relay pattern for AI pair-programming:
@@ -22,21 +48,33 @@ Leonard implements a simple relay pattern for AI pair-programming:
 
 ## Prerequisites
 
-Leonard requires these external CLI tools in your `PATH`:
+Leonard requires:
 
-1. **`claude` CLI** - Anthropic's Claude Code CLI tool
+1. **Rust toolchain** (1.70+) - for building Leonard itself
+   - **Recommended**: Install via `rustup-init` for version management:
+     ```bash
+     brew install rustup-init
+     rustup-init
+     source "$HOME/.cargo/env"  # or open a new terminal
+     ```
+   - **Alternative**: Install directly via Homebrew (simpler, but no toolchain management):
+     ```bash
+     brew install rust
+     ```
+
+2. **`claude` CLI** - Anthropic's Claude Code CLI tool
    - Used as the Driver agent (writes code)
    - Must support `-p`, `--continue`, `--permission-mode`, `--output-format stream-json`
    - Requires `ANTHROPIC_API_KEY` environment variable
 
-2. **`codex` CLI** - OpenAI Codex CLI tool
+3. **`codex` CLI** - OpenAI Codex CLI tool
    - Used as the Navigator agent (reviews and guides)
    - Must support `exec`, `--sandbox read-only`, `--json`
    - Requires `OPENAI_API_KEY` environment variable
 
-3. **Rust toolchain** (1.70+) - for building Leonard itself
-
 ## Installation
+
+If you already completed the [Quick Start](#quick-start), you can skip the Rust installation steps.
 
 ```bash
 # Clone the repository
