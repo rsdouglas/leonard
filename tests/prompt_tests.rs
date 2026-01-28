@@ -5,6 +5,8 @@ fn test_build_driver_prompt_task_only() {
     let task = "Fix the bug in login";
     let prompt = build_driver_prompt(Some(task), None);
 
+    assert!(prompt.starts_with("Explain your plan first"));
+    assert!(prompt.contains("so your peer and navigator can help identify blindspots"));
     assert!(prompt.contains("## Task"));
     assert!(prompt.contains(task));
     assert!(!prompt.contains("## Context"));
@@ -15,6 +17,8 @@ fn test_build_driver_prompt_context_only() {
     let context = "This is a login system using OAuth";
     let prompt = build_driver_prompt(None, Some(context));
 
+    assert!(prompt.starts_with("Explain your plan first"));
+    assert!(prompt.contains("so your peer and navigator can help identify blindspots"));
     assert!(prompt.contains("## Context"));
     assert!(prompt.contains(context));
     assert!(!prompt.contains("## Task"));
@@ -26,6 +30,8 @@ fn test_build_driver_prompt_both() {
     let context = "This is a login system";
     let prompt = build_driver_prompt(Some(task), Some(context));
 
+    assert!(prompt.starts_with("Explain your plan first"));
+    assert!(prompt.contains("so your peer and navigator can help identify blindspots"));
     assert!(prompt.contains("## Task"));
     assert!(prompt.contains(task));
     assert!(prompt.contains("## Context"));
@@ -110,6 +116,11 @@ fn test_build_navigator_prompt_continuation() {
 // Inline the functions for testing (since they're not public)
 fn build_driver_prompt(task: Option<&str>, context: Option<&str>) -> String {
     let mut parts = Vec::new();
+
+    // Add guidance for pair programming
+    parts.push(String::from(
+        "Explain your plan first, so your peer and navigator can help identify blindspots, then build it with your peer's feedback."
+    ));
 
     if let Some(t) = task {
         parts.push(format!("## Task\n{}", t));

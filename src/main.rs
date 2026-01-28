@@ -336,6 +336,11 @@ async fn run_driver(
 fn build_driver_prompt(task: Option<&str>, context: Option<&str>) -> String {
     let mut parts = Vec::new();
 
+    // Add guidance for pair programming
+    parts.push(String::from(
+        "Explain your plan first, so your peer and navigator can help identify blindspots, then build it with your peer's feedback."
+    ));
+
     if let Some(t) = task {
         parts.push(format!("## Task\n{}", t));
     }
