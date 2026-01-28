@@ -121,10 +121,6 @@ fn log_line(tag: &str, msg: &str) {
     eprintln!("{} [{}] {}", timestamp(), tag, msg);
 }
 
-pub fn strip_ansi(input: &str) -> String {
-    let bytes = strip_ansi_escapes::strip(input);
-    String::from_utf8_lossy(&bytes).to_string()
-}
 
 fn should_use_colors() -> bool {
     // Respect NO_COLOR environment variable
@@ -152,6 +148,11 @@ fn maybe_color<S: Into<String>>(s: S, color_fn: impl Fn(String) -> ColoredString
     }
 }
 
+fn strip_ansi(input: &str) -> String {
+    let bytes = strip_ansi_escapes::strip(input);
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
 fn truncate_line(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
@@ -159,6 +160,25 @@ fn truncate_line(s: &str, max_chars: usize) -> String {
         let truncated: String = s.chars().take(max_chars).collect();
         format!("{}...", truncated)
     }
+}
+
+fn truncate(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        text.to_string()
+    } else {
+        let target_start = text.len() - max_bytes;
+        let start = text
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| i >= target_start)
+            .unwrap_or(text.len());
+        format!("[...truncated...]\n{}", &text[start..])
+    }
+}
+
+fn navigator_signaled_done(output: &str) -> bool {
+    let trimmed = output.trim();
+    trimmed == "ALL_DONE" || trimmed.to_uppercase() == "ALL_DONE"
 }
 
 fn summarize_tool_result(content: &Option<serde_json::Value>) -> String {
@@ -212,6 +232,9 @@ fn summarize_command_output(output: &Option<String>) -> String {
         }
     }
 }
+
+
+
 
 /// Kill child process and wait for it to exit
 async fn kill_child(child: &mut Child, name: &str) {
@@ -469,52 +492,50 @@ async fn run_navigator(
             line = reader.next_line() => {
                 match line {
                     Ok(Some(line)) => {
-                        if let Ok(event) = serde_json::from_str::<CodexEvent>(&line) {
-                            if let CodexEvent::ItemCompleted { item } = event {
-                                match item {
-                                    CodexItem::Reasoning { text } => {
-                                        if let Some(t) = text {
-                                            if !t.is_empty() {
-                                                for l in t.lines() {
-                                                    println!("{}", maybe_color(format!("  thinking: {}", truncate_line(l, 80)), |s| s.magenta().dimmed()));
-                                                }
+                        if let Ok(CodexEvent::ItemCompleted { item }) = serde_json::from_str::<CodexEvent>(&line) {
+                            match item {
+                                CodexItem::Reasoning { text } => {
+                                    if let Some(t) = text {
+                                        if !t.is_empty() {
+                                            for l in t.lines() {
+                                                println!("{}", maybe_color(format!("  thinking: {}", truncate_line(l, 80)), |s| s.magenta().dimmed()));
                                             }
                                         }
                                     }
-                                    CodexItem::AgentMessage { text } => {
-                                        if let Some(t) = text {
-                                            if !t.is_empty() {
-                                                println!("{}", maybe_color(t.clone(), |s| s.magenta()));
-                                                collected.push(t);
-                                            }
-                                        }
-                                    }
-                                    CodexItem::CommandExecution { command, exit_code, output } => {
-                                        let cmd_str = command.unwrap_or_default();
-                                        if !cmd_str.is_empty() {
-                                            let summary = summarize_command_output(&output);
-                                            let exit = exit_code.unwrap_or(0);
-                                            if summary.is_empty() {
-                                                println!("{}", maybe_color(format!("  [exit {}] {}", exit, truncate_line(&cmd_str, 60)), |s| s.bright_magenta()));
-                                            } else {
-                                                println!(
-                                                    "{}",
-                                                    maybe_color(
-                                                        format!(
-                                                            "  [exit {}] {} -> {}",
-                                                            exit,
-                                                            truncate_line(&cmd_str, 40),
-                                                            truncate_line(&summary, 30)
-                                                        ),
-                                                        |s| s.bright_magenta()
-                                                    )
-                                                );
-                                            }
-                                            let _ = out.flush();
-                                        }
-                                    }
-                                    CodexItem::Unknown => {}
                                 }
+                                CodexItem::AgentMessage { text } => {
+                                    if let Some(t) = text {
+                                        if !t.is_empty() {
+                                            println!("{}", maybe_color(t.clone(), |s| s.magenta()));
+                                            collected.push(t);
+                                        }
+                                    }
+                                }
+                                CodexItem::CommandExecution { command, exit_code, output } => {
+                                    let cmd_str = command.unwrap_or_default();
+                                    if !cmd_str.is_empty() {
+                                        let summary = summarize_command_output(&output);
+                                        let exit = exit_code.unwrap_or(0);
+                                        if summary.is_empty() {
+                                            println!("{}", maybe_color(format!("  [exit {}] {}", exit, truncate_line(&cmd_str, 60)), |s| s.bright_magenta()));
+                                        } else {
+                                            println!(
+                                                "{}",
+                                                maybe_color(
+                                                    format!(
+                                                        "  [exit {}] {} -> {}",
+                                                        exit,
+                                                        truncate_line(&cmd_str, 40),
+                                                        truncate_line(&summary, 30)
+                                                    ),
+                                                    |s| s.bright_magenta()
+                                                )
+                                            );
+                                        }
+                                        let _ = out.flush();
+                                    }
+                                }
+                                CodexItem::Unknown => {}
                             }
                         }
                     }
@@ -537,19 +558,6 @@ async fn run_navigator(
     Ok(collected.join("\n"))
 }
 
-pub fn truncate(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        text.to_string()
-    } else {
-        let target_start = text.len() - max_bytes;
-        let start = text
-            .char_indices()
-            .map(|(i, _)| i)
-            .find(|&i| i >= target_start)
-            .unwrap_or(text.len());
-        format!("[...truncated...]\n{}", &text[start..])
-    }
-}
 
 async fn run_batch(args: &Args, task: Option<&str>, context: Option<&str>) -> Result<()> {
     if let Some(t) = task {
@@ -619,10 +627,6 @@ async fn run_batch(args: &Args, task: Option<&str>, context: Option<&str>) -> Re
     Ok(())
 }
 
-fn navigator_signaled_done(output: &str) -> bool {
-    let trimmed = output.trim();
-    trimmed == "ALL_DONE" || trimmed.to_uppercase() == "ALL_DONE"
-}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -660,4 +664,268 @@ async fn main() -> Result<()> {
     }
 
     run_batch(&args, task, context.as_deref()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // truncate() tests
+    #[test]
+    fn test_truncate_short_text() {
+        let text = "Hello, world!";
+        let result = truncate(text, 100);
+        assert_eq!(result, "Hello, world!");
+    }
+
+    #[test]
+    fn test_truncate_exact_length() {
+        let text = "Hello";
+        let result = truncate(text, 5);
+        assert_eq!(result, "Hello");
+    }
+
+    #[test]
+    fn test_truncate_long_text() {
+        let text = "Hello, world! This is a longer message that needs truncation.";
+        let result = truncate(text, 20);
+
+        assert!(result.starts_with("[...truncated...]"));
+        assert!(result.len() <= "[...truncated...]\n".len() + 20);
+        assert!(result.contains("truncation."));
+    }
+
+    #[test]
+    fn test_truncate_utf8_boundary() {
+        // Test with emoji and multi-byte UTF-8 characters
+        let text = "Hello 👋 世界";
+        let result = truncate(text, 10);
+
+        // Should not panic and should produce valid UTF-8
+        assert!(!result.is_empty());
+        // The result should either be the full string or a truncated valid UTF-8 string
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_truncate_zero_max() {
+        let text = "Hello, world!";
+        let result = truncate(text, 0);
+
+        // Should handle edge case gracefully
+        assert!(result.starts_with("[...truncated...]"));
+    }
+
+    // truncate_line() tests
+    #[test]
+    fn test_truncate_line_short() {
+        let text = "Short";
+        let result = truncate_line(text, 10);
+        assert_eq!(result, "Short");
+    }
+
+    #[test]
+    fn test_truncate_line_exact() {
+        let text = "Exactly10!";
+        let result = truncate_line(text, 10);
+        assert_eq!(result, "Exactly10!");
+    }
+
+    #[test]
+    fn test_truncate_line_long() {
+        let text = "This is a very long line that should be truncated";
+        let result = truncate_line(text, 20);
+        assert_eq!(result, "This is a very long ...");
+        assert_eq!(result.chars().count(), 23); // 20 chars + "..."
+    }
+
+    #[test]
+    fn test_truncate_line_with_emoji() {
+        let text = "Hello 👋👋👋👋👋👋👋";
+        let result = truncate_line(text, 10);
+
+        // Should count characters, not bytes
+        assert!(result.chars().count() <= 13); // 10 + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    // strip_ansi() tests
+    #[test]
+    fn test_strip_ansi_no_codes() {
+        let input = "Plain text";
+        let result = strip_ansi(input);
+        assert_eq!(result, "Plain text");
+    }
+
+    #[test]
+    fn test_strip_ansi_with_color_codes() {
+        let input = "\x1b[31mRed text\x1b[0m";
+        let result = strip_ansi(input);
+        assert_eq!(result, "Red text");
+    }
+
+    #[test]
+    fn test_strip_ansi_multiple_codes() {
+        let input = "\x1b[1m\x1b[32mBold green\x1b[0m normal \x1b[33myellow\x1b[0m";
+        let result = strip_ansi(input);
+        assert_eq!(result, "Bold green normal yellow");
+    }
+
+    #[test]
+    fn test_strip_ansi_empty() {
+        let input = "";
+        let result = strip_ansi(input);
+        assert_eq!(result, "");
+    }
+
+    // navigator_signaled_done() tests
+    #[test]
+    fn test_navigator_signaled_done_exact() {
+        assert!(navigator_signaled_done("ALL_DONE"));
+    }
+
+    #[test]
+    fn test_navigator_signaled_done_lowercase() {
+        assert!(navigator_signaled_done("all_done"));
+    }
+
+    #[test]
+    fn test_navigator_signaled_done_mixed_case() {
+        assert!(navigator_signaled_done("All_Done"));
+        assert!(navigator_signaled_done("aLL_dONE"));
+    }
+
+    #[test]
+    fn test_navigator_signaled_done_with_whitespace() {
+        assert!(navigator_signaled_done("  ALL_DONE  "));
+        assert!(navigator_signaled_done("\nALL_DONE\n"));
+        assert!(navigator_signaled_done("\t\tALL_DONE\t\t"));
+    }
+
+    #[test]
+    fn test_navigator_signaled_done_false() {
+        assert!(!navigator_signaled_done("Not done yet"));
+        assert!(!navigator_signaled_done("ALMOST_DONE"));
+        assert!(!navigator_signaled_done("ALL_DONE but more text"));
+        assert!(!navigator_signaled_done(""));
+    }
+
+    // summarize_tool_result() tests
+    #[test]
+    fn test_summarize_tool_result_none() {
+        let result = summarize_tool_result(&None);
+        assert_eq!(result, "done");
+    }
+
+    #[test]
+    fn test_summarize_tool_result_short_string() {
+        let content = Some(json!("Short message"));
+        let result = summarize_tool_result(&content);
+        assert_eq!(result, "Short message");
+    }
+
+    #[test]
+    fn test_summarize_tool_result_long_string() {
+        let long_text = "x".repeat(150);
+        let content = Some(json!(long_text));
+        let result = summarize_tool_result(&content);
+
+        assert!(result.len() <= 103); // 100 + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_summarize_tool_result_multiline_short() {
+        let content = Some(json!("Line 1\nLine 2\nLine 3"));
+        let result = summarize_tool_result(&content);
+
+        // 3 lines or fewer should show the content
+        assert!(result.contains("Line"));
+    }
+
+    #[test]
+    fn test_summarize_tool_result_multiline_long() {
+        let content = Some(json!("Line 1\nLine 2\nLine 3\nLine 4\nLine 5"));
+        let result = summarize_tool_result(&content);
+
+        // More than 3 lines should just show count
+        assert_eq!(result, "5 lines");
+    }
+
+    #[test]
+    fn test_summarize_tool_result_array_with_text() {
+        let content = Some(json!([
+            {"type": "text", "text": "First message"},
+            {"type": "text", "text": "Second message"}
+        ]));
+        let result = summarize_tool_result(&content);
+
+        assert!(result.contains("First message"));
+    }
+
+    #[test]
+    fn test_summarize_tool_result_array_without_text() {
+        let content = Some(json!([
+            {"type": "image", "data": "..."},
+            {"type": "other", "value": 123}
+        ]));
+        let result = summarize_tool_result(&content);
+
+        assert_eq!(result, "2 items");
+    }
+
+    #[test]
+    fn test_summarize_tool_result_other_json() {
+        let content = Some(json!({"status": "ok", "count": 42}));
+        let result = summarize_tool_result(&content);
+
+        assert!(result.len() <= 50);
+    }
+
+    // summarize_command_output() tests
+    #[test]
+    fn test_summarize_command_output_none() {
+        let result = summarize_command_output(&None);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_summarize_command_output_empty() {
+        let result = summarize_command_output(&Some(String::new()));
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_summarize_command_output_short() {
+        let output = Some("Command output".to_string());
+        let result = summarize_command_output(&output);
+        assert_eq!(result, "Command output");
+    }
+
+    #[test]
+    fn test_summarize_command_output_multiline_short() {
+        let output = Some("Line 1\nLine 2\nLine 3".to_string());
+        let result = summarize_command_output(&output);
+
+        // 3 lines or fewer should show content
+        assert!(result.contains("Line"));
+    }
+
+    #[test]
+    fn test_summarize_command_output_multiline_long() {
+        let output = Some("Line 1\nLine 2\nLine 3\nLine 4\nLine 5".to_string());
+        let result = summarize_command_output(&output);
+
+        assert_eq!(result, "5 lines");
+    }
+
+    #[test]
+    fn test_summarize_command_output_long_single_line() {
+        let long_output = Some("x".repeat(150));
+        let result = summarize_command_output(&long_output);
+
+        assert!(result.len() <= 103); // 100 + "..."
+        assert!(result.ends_with("..."));
+    }
 }
