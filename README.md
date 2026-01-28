@@ -21,7 +21,7 @@ rustc --version
 cargo --version
 
 # Clone and build Leonard
-git clone <repository-url>
+git clone https://github.com/rsdouglas/leonard
 cd leonard
 cargo build --release
 ```
@@ -78,7 +78,7 @@ If you already completed the [Quick Start](#quick-start), you can skip the Rust 
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/rsdouglas/leonard
 cd leonard
 
 # Copy environment template and add your API keys
