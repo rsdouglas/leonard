@@ -170,6 +170,8 @@ This is a React + TypeScript project using Vite.
 
 ## How It Works
 
+Leonard runs preflight checks at startup to validate that `claude` and `codex` binaries are available and warn if API keys are missing.
+
 1. **Driver turn**: Leonard spawns `claude -p` with the task, captures stdout and parses JSON events to extract text
 2. **Navigator turn**: Extracted Driver text is forwarded to `codex exec --sandbox read-only` (first turn) or `codex resume --last` (continuation)
 3. **Driver continuation**: Navigator feedback is parsed from JSONL and sent to `claude -p --continue`
@@ -179,7 +181,7 @@ Output is streamed to stdout with section headers (`=== DRIVER ===`, `=== NAVIGA
 
 ## Architecture Notes
 
-Leonard spawns both agents as child processes and uses `stdout` pipes (`Stdio::piped()`) to capture their output. Stderr is piped but not actively consumed.
+Leonard spawns both agents as child processes and uses `stdout` pipes (`Stdio::piped()`) to capture their output. Stderr is also captured and displayed if a process exits with non-zero status.
 
 ## Contributing
 

@@ -242,6 +242,173 @@ async fn kill_child(child: &mut Child, name: &str) {
     let _ = child.kill().await;
 }
 
+/// Check if a binary exists and is executable on PATH
+async fn check_binary_exists(binary: &str) -> Result<()> {
+    Command::new(binary)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .with_context(|| format!("Binary '{}' not found on PATH or not executable", binary))?;
+    Ok(())
+}
+
+/// Validate that the working directory exists and is accessible
+fn validate_working_directory(cwd: &PathBuf) -> Result<()> {
+    if !cwd.exists() {
+        anyhow::bail!("Working directory does not exist: {}", cwd.display());
+    }
+    if !cwd.is_dir() {
+        anyhow::bail!("Path is not a directory: {}", cwd.display());
+    }
+    Ok(())
+}
+
+/// Warn if an API key is missing or empty (non-blocking)
+fn warn_if_missing_api_key(key_name: &str, agent_name: &str) {
+    match std::env::var(key_name) {
+        Ok(val) if !val.trim().is_empty() => {
+            // Key is set and non-empty, all good
+        }
+        Ok(_) => {
+            // Key is set but empty/whitespace
+            log_line(
+                "system",
+                &format!("warning: {} is empty (required for {})", key_name, agent_name)
+            );
+        }
+        Err(_) => {
+            // Key is not set
+            log_line(
+                "system",
+                &format!("warning: {} not set (required for {})", key_name, agent_name)
+            );
+        }
+    }
+}
+
+/// Run all preflight checks before starting agent orchestration
+async fn validate_prerequisites(args: &Args) -> Result<()> {
+    // 1. Check binaries exist (lightweight --version check)
+    check_binary_exists("claude")
+        .await
+        .context("Driver binary 'claude' not found. Install Claude Code CLI.")?;
+    check_binary_exists("codex")
+        .await
+        .context("Navigator binary 'codex' not found. Install Codex CLI.")?;
+
+    // 2. Validate cwd if provided
+    if let Some(ref cwd) = args.cwd {
+        validate_working_directory(cwd)
+            .context("Invalid working directory")?;
+    }
+
+    // 3. Warn about missing API keys (non-blocking)
+    warn_if_missing_api_key("ANTHROPIC_API_KEY", "claude driver");
+    warn_if_missing_api_key("OPENAI_API_KEY", "codex navigator");
+
+    log_line("system", "preflight checks passed");
+    Ok(())
+}
+
+/// Process a single driver stdout line, updating collected output
+fn process_driver_line(
+    line: &str,
+    collected: &mut Vec<String>,
+    out: &mut std::io::Stdout,
+) -> bool {
+    if let Ok(event) = serde_json::from_str::<ClaudeEvent>(line) {
+        match event {
+            ClaudeEvent::Assistant { message } => {
+                for block in message.content {
+                    match block {
+                        ContentBlock::Text { text } => {
+                            println!("{}", maybe_color(text.clone(), |s| s.cyan()));
+                            collected.push(text);
+                        }
+                        ContentBlock::ToolUse { name } => {
+                            print!("{}", maybe_color(format!("  [{}] ", name), |s| s.bright_cyan()));
+                            let _ = out.flush();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ClaudeEvent::User { message } => {
+                for block in message.content {
+                    if let ContentBlock::ToolResult { content } = block {
+                        let summary = summarize_tool_result(&content);
+                        println!("{}", maybe_color(format!("  -> {}", summary), |s| s.cyan().dimmed()));
+                        collected.push(format!("  -> {}", summary));
+                    }
+                }
+            }
+            ClaudeEvent::Result { .. } | ClaudeEvent::Unknown => {}
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Process a single navigator stdout line, updating collected output
+fn process_navigator_line(
+    line: &str,
+    collected: &mut Vec<String>,
+    out: &mut std::io::Stdout,
+) -> bool {
+    if let Ok(CodexEvent::ItemCompleted { item }) = serde_json::from_str::<CodexEvent>(line) {
+        match item {
+            CodexItem::Reasoning { text } => {
+                if let Some(t) = text {
+                    if !t.is_empty() {
+                        for l in t.lines() {
+                            println!("{}", maybe_color(format!("  thinking: {}", truncate_line(l, 80)), |s| s.magenta().dimmed()));
+                        }
+                    }
+                }
+            }
+            CodexItem::AgentMessage { text } => {
+                if let Some(t) = text {
+                    if !t.is_empty() {
+                        println!("{}", maybe_color(t.clone(), |s| s.magenta()));
+                        collected.push(t);
+                    }
+                }
+            }
+            CodexItem::CommandExecution { command, exit_code, output } => {
+                let cmd_str = command.unwrap_or_default();
+                if !cmd_str.is_empty() {
+                    let summary = summarize_command_output(&output);
+                    let exit = exit_code.unwrap_or(0);
+                    if summary.is_empty() {
+                        println!("{}", maybe_color(format!("  [exit {}] {}", exit, truncate_line(&cmd_str, 60)), |s| s.bright_magenta()));
+                    } else {
+                        println!(
+                            "{}",
+                            maybe_color(
+                                format!(
+                                    "  [exit {}] {} -> {}",
+                                    exit,
+                                    truncate_line(&cmd_str, 40),
+                                    truncate_line(&summary, 30)
+                                ),
+                                |s| s.bright_magenta()
+                            )
+                        );
+                    }
+                    let _ = out.flush();
+                }
+            }
+            CodexItem::Unknown => {}
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Run Claude in print mode with JSON streaming and return its output
 async fn run_driver(
     cwd: &Option<PathBuf>,
@@ -289,10 +456,16 @@ async fn run_driver(
 
     let mut child = cmd.spawn().context("failed to spawn claude")?;
     let stdout = child.stdout.take().context("missing driver stdout")?;
-    let mut reader = BufReader::new(stdout).lines();
+    let stderr = child.stderr.take().context("missing driver stderr")?;
+    let mut stdout_reader = BufReader::new(stdout).lines();
+    let mut stderr_reader = BufReader::new(stderr).lines();
 
     let mut collected = Vec::new();
+    let mut stderr_lines = Vec::new();
     let mut out = std::io::stdout();
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut child_status = None;
 
     loop {
         tokio::select! {
@@ -303,52 +476,62 @@ async fn run_driver(
                 anyhow::bail!("interrupted by user");
             }
 
-            line = reader.next_line() => {
+            status = child.wait(), if child_status.is_none() => {
+                child_status = Some(status.context("failed to wait for claude")?);
+                // Process exited - break out and drain remaining buffered lines
+                break;
+            }
+
+            line = stdout_reader.next_line(), if !stdout_done => {
                 match line {
                     Ok(Some(line)) => {
-                        if let Ok(event) = serde_json::from_str::<ClaudeEvent>(&line) {
-                            match event {
-                                ClaudeEvent::Assistant { message } => {
-                                    for block in message.content {
-                                        match block {
-                                            ContentBlock::Text { text } => {
-                                                println!("{}", maybe_color(text.clone(), |s| s.cyan()));
-                                                collected.push(text);
-                                            }
-                                            ContentBlock::ToolUse { name } => {
-                                                print!("{}", maybe_color(format!("  [{}] ", name), |s| s.bright_cyan()));
-                                                let _ = out.flush();
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                ClaudeEvent::User { message } => {
-                                    for block in message.content {
-                                        if let ContentBlock::ToolResult { content } = block {
-                                            let summary = summarize_tool_result(&content);
-                                            println!("{}", maybe_color(format!("  -> {}", summary), |s| s.cyan().dimmed()));
-                                            collected.push(format!("  -> {}", summary));
-                                        }
-                                    }
-                                }
-                                ClaudeEvent::Result { .. } | ClaudeEvent::Unknown => {}
-                            }
+                        if !process_driver_line(&line, &mut collected, &mut out) {
+                            log_line("driver-err", &format!("failed to parse stdout line: {}", truncate_line(&line, 100)));
                         }
                     }
-                    Ok(None) => break,
+                    Ok(None) => stdout_done = true,
                     Err(e) => {
-                        log_line("driver-err", &format!("read error: {}", e));
-                        break;
+                        log_line("driver-err", &format!("stdout read error: {}", e));
+                        stdout_done = true;
+                    }
+                }
+            }
+
+            line = stderr_reader.next_line(), if !stderr_done => {
+                match line {
+                    Ok(Some(line)) => {
+                        stderr_lines.push(line);
+                    }
+                    Ok(None) => stderr_done = true,
+                    Err(e) => {
+                        log_line("driver-err", &format!("stderr read error: {}", e));
+                        stderr_done = true;
                     }
                 }
             }
         }
     }
 
-    let status = child.wait().await.context("failed to wait for claude")?;
+    // Drain any remaining lines from stdout/stderr after process exits
+    while let Ok(Some(line)) = stdout_reader.next_line().await {
+        if !process_driver_line(&line, &mut collected, &mut out) {
+            log_line("driver-err", &format!("failed to parse stdout line during drain: {}", truncate_line(&line, 100)));
+        }
+    }
+    while let Ok(Some(line)) = stderr_reader.next_line().await {
+        stderr_lines.push(line);
+    }
+
+    let status = child_status.expect("child_status should be set");
 
     if !status.success() {
+        if !stderr_lines.is_empty() {
+            log_line("driver-err", "stderr output:");
+            for line in &stderr_lines {
+                log_line("driver-err", line);
+            }
+        }
+
         anyhow::bail!("driver exited with status: {}", status);
     }
 
@@ -437,6 +620,8 @@ async fn run_navigator(
     let mut cmd = Command::new("codex");
     cmd.arg("exec");
 
+    cmd.arg("--skip-git-repo-check");
+    
     if is_continuation {
         cmd.arg("resume");
         cmd.arg("--last");
@@ -445,9 +630,6 @@ async fn run_navigator(
     } else {
         cmd.arg("--sandbox").arg("read-only");
         cmd.arg("--json");
-        if let Some(dir) = cwd {
-            cmd.arg("-C").arg(dir);
-        }
         cmd.arg(prompt);
     }
 
@@ -475,10 +657,16 @@ async fn run_navigator(
 
     let mut child = cmd.spawn().context("failed to spawn codex")?;
     let stdout = child.stdout.take().context("missing navigator stdout")?;
-    let mut reader = BufReader::new(stdout).lines();
+    let stderr = child.stderr.take().context("missing navigator stderr")?;
+    let mut stdout_reader = BufReader::new(stdout).lines();
+    let mut stderr_reader = BufReader::new(stderr).lines();
 
     let mut collected = Vec::new();
+    let mut stderr_lines = Vec::new();
     let mut out = std::io::stdout();
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut child_status = None;
 
     loop {
         tokio::select! {
@@ -489,69 +677,62 @@ async fn run_navigator(
                 anyhow::bail!("interrupted by user");
             }
 
-            line = reader.next_line() => {
+            status = child.wait(), if child_status.is_none() => {
+                child_status = Some(status.context("failed to wait for codex")?);
+                // Process exited - break out and drain remaining buffered lines
+                break;
+            }
+
+            line = stdout_reader.next_line(), if !stdout_done => {
                 match line {
                     Ok(Some(line)) => {
-                        if let Ok(CodexEvent::ItemCompleted { item }) = serde_json::from_str::<CodexEvent>(&line) {
-                            match item {
-                                CodexItem::Reasoning { text } => {
-                                    if let Some(t) = text {
-                                        if !t.is_empty() {
-                                            for l in t.lines() {
-                                                println!("{}", maybe_color(format!("  thinking: {}", truncate_line(l, 80)), |s| s.magenta().dimmed()));
-                                            }
-                                        }
-                                    }
-                                }
-                                CodexItem::AgentMessage { text } => {
-                                    if let Some(t) = text {
-                                        if !t.is_empty() {
-                                            println!("{}", maybe_color(t.clone(), |s| s.magenta()));
-                                            collected.push(t);
-                                        }
-                                    }
-                                }
-                                CodexItem::CommandExecution { command, exit_code, output } => {
-                                    let cmd_str = command.unwrap_or_default();
-                                    if !cmd_str.is_empty() {
-                                        let summary = summarize_command_output(&output);
-                                        let exit = exit_code.unwrap_or(0);
-                                        if summary.is_empty() {
-                                            println!("{}", maybe_color(format!("  [exit {}] {}", exit, truncate_line(&cmd_str, 60)), |s| s.bright_magenta()));
-                                        } else {
-                                            println!(
-                                                "{}",
-                                                maybe_color(
-                                                    format!(
-                                                        "  [exit {}] {} -> {}",
-                                                        exit,
-                                                        truncate_line(&cmd_str, 40),
-                                                        truncate_line(&summary, 30)
-                                                    ),
-                                                    |s| s.bright_magenta()
-                                                )
-                                            );
-                                        }
-                                        let _ = out.flush();
-                                    }
-                                }
-                                CodexItem::Unknown => {}
-                            }
+                        if !process_navigator_line(&line, &mut collected, &mut out) {
+                            log_line("navigator-err", &format!("failed to parse stdout line: {}", truncate_line(&line, 100)));
                         }
                     }
-                    Ok(None) => break,
+                    Ok(None) => stdout_done = true,
                     Err(e) => {
-                        log_line("navigator-err", &format!("read error: {}", e));
-                        break;
+                        log_line("navigator-err", &format!("stdout read error: {}", e));
+                        stdout_done = true;
+                    }
+                }
+            }
+
+            line = stderr_reader.next_line(), if !stderr_done => {
+                match line {
+                    Ok(Some(line)) => {
+                        stderr_lines.push(line);
+                    }
+                    Ok(None) => stderr_done = true,
+                    Err(e) => {
+                        log_line("navigator-err", &format!("stderr read error: {}", e));
+                        stderr_done = true;
                     }
                 }
             }
         }
     }
 
-    let status = child.wait().await.context("failed to wait for codex")?;
+    // Drain any remaining lines from stdout/stderr after process exits
+    while let Ok(Some(line)) = stdout_reader.next_line().await {
+        if !process_navigator_line(&line, &mut collected, &mut out) {
+            log_line("navigator-err", &format!("failed to parse stdout line during drain: {}", truncate_line(&line, 100)));
+        }
+    }
+    while let Ok(Some(line)) = stderr_reader.next_line().await {
+        stderr_lines.push(line);
+    }
+
+    let status = child_status.expect("child_status should be set");
 
     if !status.success() {
+        if !stderr_lines.is_empty() {
+            log_line("navigator-err", "stderr output:");
+            for line in &stderr_lines {
+                log_line("navigator-err", line);
+            }
+        }
+
         anyhow::bail!("navigator exited with status: {}", status);
     }
 
@@ -631,6 +812,9 @@ async fn run_batch(args: &Args, task: Option<&str>, context: Option<&str>) -> Re
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Run preflight checks before starting orchestration
+    validate_prerequisites(&args).await?;
 
     // Read leonard.md if present in cwd
     let leonard_path = if let Some(ref dir) = args.cwd {
