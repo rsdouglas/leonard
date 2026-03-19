@@ -784,55 +784,38 @@ fn task_prefix(task: Option<&str>) -> String {
 }
 
 /// Build the navigator meta-prompt that frames the review context
-fn build_navigator_prompt(task: Option<&str>, context: Option<&str>, driver_output: &str, is_first_message: bool) -> String {
-    if !is_first_message {
-        format!(
-            r#"{prefix}The driver has responded:
-
----
-{driver_output}
----
-
-Review this response. If the task is complete, respond with "ALL_DONE".
-"#,
-            prefix = task_prefix(task),
-            driver_output = driver_output
-        )
-    } else {
-        let mut prompt = String::from(
-            r#"ROLE: Helpful Peer
-You are acting as a helpful peer. Your job is to evaluate the driver's work for the task below.
-Do not offer to do things. Discuss, comment, and guide the driver.
-Your job is not to block the driver, but to help them make progress and point out things they may have missed.
-Progress is the goal, not perfection. We work iteratively, so we can improve incrementally.
-Assume what they are telling you they have done is true - they don't usually lie.
-Anything they say is directed at you, not the user. You are the user from the Driver's perspective.
+fn build_navigator_prompt(task: Option<&str>, context: Option<&str>, driver_output: &str, _is_first_message: bool) -> String {
+    let mut prompt = String::from(
+        r#"ROLE: Helpful Peer
+You are a peer participant in a back-and-forth conversation with the Driver. Engage directly with what they said.
+Do not evaluate whether the task is "complete" — just respond as a peer would: agree, push back, add thoughts, ask questions.
+Do not offer to do things yourself. Discuss, comment, and guide.
+Progress is the goal, not perfection. Work iteratively.
+Anything the Driver says is directed at you. You are the user from the Driver's perspective.
+Only respond with exactly "ALL_DONE" (nothing else) when the work is genuinely finished.
 
 "#
-        );
+    );
 
-        if let Some(t) = task {
-            prompt.push_str(&format!("## Original Task\n{}\n\n", t));
-        }
+    if let Some(t) = task {
+        prompt.push_str(&format!("## Task\n{}\n\n", t));
+    }
 
-        if let Some(c) = context {
-            prompt.push_str(&format!("## Context\n{}\n\n", c));
-        }
+    if let Some(c) = context {
+        prompt.push_str(&format!("## Context\n{}\n\n", c));
+    }
 
-        prompt.push_str(&format!(
-            r#"## Driver's Output
+    prompt.push_str(&format!(
+        r#"## Driver says:
 
 ---
 {driver_output}
 ---
-
-If the task is complete, you can end the conversation with "ALL_DONE".
 "#,
-            driver_output = driver_output
-        ));
+        driver_output = driver_output
+    ));
 
-        prompt
-    }
+    prompt
 }
 
 /// Run Codex exec with JSON mode and return its output (read-only sandbox)
