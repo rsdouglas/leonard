@@ -407,10 +407,19 @@ fn summarize_command_output(output: &Option<String>) -> String {
 
 
 
-/// Kill child process and wait for it to exit
+/// Kill a child's entire process group then wait for it to exit
 async fn kill_child(child: &mut Child, name: &str) {
     log_line("system", &format!("killing {} process", name));
-    let _ = child.kill().await;
+
+    // Kill the whole process group so any grandchildren die too
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // process_group(0) was set at spawn time, so pgid == pid
+        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    }
+
+    let _ = child.kill().await;   // belt-and-suspenders: kill the direct child too
+    let _ = child.wait().await;   // reap so it doesn't linger as a zombie
 }
 
 /// Check if a binary exists and is executable on PATH
@@ -661,6 +670,8 @@ async fn run_driver(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let prompt_preview: String = prompt.chars().take(80).collect();
     log_line(
@@ -859,6 +870,8 @@ async fn run_navigator(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     let prompt_preview: String = prompt.chars().take(80).collect();
     log_line(
@@ -1037,7 +1050,8 @@ async fn run_batch_inner(
             return Ok((turns_completed, false));
         }
 
-        let feedback = format!("{}{}",
+        let feedback = format!(
+            "You are the Driver in a pair programming session. Your navigator will respond after you — do not simulate or speak for them. Do your part, then stop.\n\n{}{}",
             task_prefix(task),
             truncate(&navigator_output, args.max_forward_bytes)
         );
