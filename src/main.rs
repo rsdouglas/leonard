@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use colored::{ColoredString, Colorize};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -77,6 +78,14 @@ enum CodexItem {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
+enum OutputFormat {
+    /// Human-readable output with colors and formatting (default)
+    Pretty,
+    /// Machine-readable JSONL events for programmatic consumption
+    Jsonl,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "leonard")]
 #[command(about = "Relay text between Driver and Navigator agents")]
@@ -108,6 +117,165 @@ struct Args {
     /// Log prompts and responses to a file for debugging
     #[arg(long)]
     log_file: Option<PathBuf>,
+
+    /// Output format for the stream
+    #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
+    output_format: OutputFormat,
+}
+
+// Global sequence counter for events
+static EVENT_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Serialize)]
+struct StreamEvent<T> {
+    run_id: String,
+    seq: usize,
+    schema_version: u32,
+    timestamp: String,
+    #[serde(rename = "type")]
+    event_type: String,
+    agent: String,
+    turn: usize,
+    data: T,
+}
+
+impl<T: Serialize> StreamEvent<T> {
+    fn new(run_id: &str, event_type: impl Into<String>, agent: impl Into<String>, turn: usize, data: T) -> Self {
+        Self {
+            run_id: run_id.to_string(),
+            seq: EVENT_SEQ.fetch_add(1, Ordering::SeqCst),
+            schema_version: 1,
+            timestamp: timestamp(),
+            event_type: event_type.into(),
+            agent: agent.into(),
+            turn,
+            data,
+        }
+    }
+
+    fn emit(&self) {
+        if let Ok(json) = serde_json::to_string(self) {
+            println!("{}", json);
+            let _ = std::io::stdout().flush();
+        }
+    }
+}
+
+// Event data structures for MVP+ (5 core events)
+
+#[derive(Debug, Serialize)]
+struct SystemStartedData {
+    cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<String>,
+    max_turns: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_length: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct TurnStartedData {
+    next_agent: String,
+    prompt_length: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct TextData {
+    text: String,
+    truncated: bool,
+    original_bytes: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct CompletedData {
+    reason: String,
+    total_turns: usize,
+}
+
+// Event emission functions
+
+fn emit_system_started(
+    run_id: &str,
+    cwd: &Option<PathBuf>,
+    task: Option<&str>,
+    max_turns: usize,
+    context: Option<&str>,
+    context_path: &std::path::Path,
+) {
+    let data = SystemStartedData {
+        cwd: cwd
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()))
+            .unwrap_or_else(|| ".".to_string()),
+        task: task.map(|s| s.to_string()),
+        max_turns,
+        context_file: context.map(|_| context_path.display().to_string()),
+        context_length: context.map(|s| s.len()),
+    };
+
+    StreamEvent::new(run_id, "system.started", "system", 0, data).emit();
+}
+
+fn emit_turn_started(run_id: &str, next_agent: &str, turn: usize, prompt_length: usize) {
+    let data = TurnStartedData {
+        next_agent: next_agent.to_string(),
+        prompt_length,
+    };
+
+    StreamEvent::new(run_id, "system.turn_started", "system", turn, data).emit();
+}
+
+// Truncation limit per event (10KB)
+const MAX_EVENT_TEXT_BYTES: usize = 10_000;
+
+fn emit_driver_text(run_id: &str, turn: usize, text: &str) {
+    let original_bytes = text.len();
+    let (text_to_emit, truncated) = if original_bytes > MAX_EVENT_TEXT_BYTES {
+        (truncate(text, MAX_EVENT_TEXT_BYTES), true)
+    } else {
+        (text.to_string(), false)
+    };
+
+    let data = TextData {
+        text: text_to_emit,
+        truncated,
+        original_bytes,
+    };
+
+    StreamEvent::new(run_id, "driver.text", "driver", turn, data).emit();
+}
+
+fn emit_navigator_message(run_id: &str, turn: usize, text: &str) {
+    let original_bytes = text.len();
+    let (text_to_emit, truncated) = if original_bytes > MAX_EVENT_TEXT_BYTES {
+        (truncate(text, MAX_EVENT_TEXT_BYTES), true)
+    } else {
+        (text.to_string(), false)
+    };
+
+    let data = TextData {
+        text: text_to_emit,
+        truncated,
+        original_bytes,
+    };
+
+    StreamEvent::new(run_id, "navigator.message", "navigator", turn, data).emit();
+}
+
+fn emit_system_completed(run_id: &str, reason: &str, total_turns: usize) {
+    let data = CompletedData {
+        reason: reason.to_string(),
+        total_turns,
+    };
+
+    // turn field is 0-indexed, so last turn = total_turns - 1
+    // Handle the case where total_turns is 0 (interrupted before any turns completed)
+    let last_turn = if total_turns > 0 { total_turns - 1 } else { 0 };
+
+    StreamEvent::new(run_id, "system.completed", "system", last_turn, data).emit();
 }
 
 fn timestamp() -> String {
@@ -317,6 +485,10 @@ fn process_driver_line(
     line: &str,
     collected: &mut Vec<String>,
     out: &mut std::io::Stdout,
+    run_id: &str,
+    format: OutputFormat,
+    turn: usize,
+    strip_ansi_flag: bool,
 ) -> bool {
     if let Ok(event) = serde_json::from_str::<ClaudeEvent>(line) {
         match event {
@@ -324,12 +496,28 @@ fn process_driver_line(
                 for block in message.content {
                     match block {
                         ContentBlock::Text { text } => {
-                            println!("{}", maybe_color(text.clone(), |s| s.cyan()));
-                            collected.push(text);
+                            // Strip ANSI codes if flag is set
+                            let clean_text = if strip_ansi_flag {
+                                strip_ansi(&text)
+                            } else {
+                                text.clone()
+                            };
+
+                            match format {
+                                OutputFormat::Pretty => {
+                                    println!("{}", maybe_color(clean_text.clone(), |s| s.cyan()));
+                                }
+                                OutputFormat::Jsonl => {
+                                    emit_driver_text(run_id, turn, &clean_text);
+                                }
+                            }
+                            collected.push(clean_text);
                         }
                         ContentBlock::ToolUse { name } => {
-                            print!("{}", maybe_color(format!("  [{}] ", name), |s| s.bright_cyan()));
-                            let _ = out.flush();
+                            if format == OutputFormat::Pretty {
+                                print!("{}", maybe_color(format!("  [{}] ", name), |s| s.bright_cyan()));
+                                let _ = out.flush();
+                            }
                         }
                         _ => {}
                     }
@@ -339,7 +527,9 @@ fn process_driver_line(
                 for block in message.content {
                     if let ContentBlock::ToolResult { content } = block {
                         let summary = summarize_tool_result(&content);
-                        println!("{}", maybe_color(format!("  -> {}", summary), |s| s.cyan().dimmed()));
+                        if format == OutputFormat::Pretty {
+                            println!("{}", maybe_color(format!("  -> {}", summary), |s| s.cyan().dimmed()));
+                        }
                         collected.push(format!("  -> {}", summary));
                     }
                 }
@@ -357,12 +547,17 @@ fn process_navigator_line(
     line: &str,
     collected: &mut Vec<String>,
     out: &mut std::io::Stdout,
+    run_id: &str,
+    format: OutputFormat,
+    turn: usize,
+    strip_ansi_flag: bool,
 ) -> bool {
-    if let Ok(CodexEvent::ItemCompleted { item }) = serde_json::from_str::<CodexEvent>(line) {
+    let parsed = serde_json::from_str::<CodexEvent>(line);
+    if let Ok(CodexEvent::ItemCompleted { item }) = parsed {
         match item {
             CodexItem::Reasoning { text } => {
                 if let Some(t) = text {
-                    if !t.is_empty() {
+                    if !t.is_empty() && format == OutputFormat::Pretty {
                         for l in t.lines() {
                             println!("{}", maybe_color(format!("  thinking: {}", truncate_line(l, 80)), |s| s.magenta().dimmed()));
                         }
@@ -372,14 +567,28 @@ fn process_navigator_line(
             CodexItem::AgentMessage { text } => {
                 if let Some(t) = text {
                     if !t.is_empty() {
-                        println!("{}", maybe_color(t.clone(), |s| s.magenta()));
-                        collected.push(t);
+                        // Strip ANSI codes if flag is set
+                        let clean_text = if strip_ansi_flag {
+                            strip_ansi(&t)
+                        } else {
+                            t.clone()
+                        };
+
+                        match format {
+                            OutputFormat::Pretty => {
+                                println!("{}", maybe_color(clean_text.clone(), |s| s.magenta()));
+                            }
+                            OutputFormat::Jsonl => {
+                                emit_navigator_message(run_id, turn, &clean_text);
+                            }
+                        }
+                        collected.push(clean_text);
                     }
                 }
             }
             CodexItem::CommandExecution { command, exit_code, output } => {
                 let cmd_str = command.unwrap_or_default();
-                if !cmd_str.is_empty() {
+                if !cmd_str.is_empty() && format == OutputFormat::Pretty {
                     let summary = summarize_command_output(&output);
                     let exit = exit_code.unwrap_or(0);
                     if summary.is_empty() {
@@ -405,7 +614,9 @@ fn process_navigator_line(
         }
         true
     } else {
-        false
+        // Return true for successfully parsed but unrecognized event types (Unknown),
+        // false only for genuine parse failures.
+        matches!(parsed, Ok(CodexEvent::Unknown))
     }
 }
 
@@ -414,6 +625,10 @@ async fn run_driver(
     cwd: &Option<PathBuf>,
     prompt: &str,
     is_continuation: bool,
+    run_id: &str,
+    format: OutputFormat,
+    turn: usize,
+    strip_ansi_flag: bool,
 ) -> Result<String> {
     if prompt.trim().is_empty() {
         anyhow::bail!("Cannot run driver with empty prompt");
@@ -485,7 +700,7 @@ async fn run_driver(
             line = stdout_reader.next_line(), if !stdout_done => {
                 match line {
                     Ok(Some(line)) => {
-                        if !process_driver_line(&line, &mut collected, &mut out) {
+                        if !process_driver_line(&line, &mut collected, &mut out, run_id, format, turn, strip_ansi_flag) {
                             log_line("driver-err", &format!("failed to parse stdout line: {}", truncate_line(&line, 100)));
                         }
                     }
@@ -514,7 +729,7 @@ async fn run_driver(
 
     // Drain any remaining lines from stdout/stderr after process exits
     while let Ok(Some(line)) = stdout_reader.next_line().await {
-        if !process_driver_line(&line, &mut collected, &mut out) {
+        if !process_driver_line(&line, &mut collected, &mut out, run_id, format, turn, strip_ansi_flag) {
             log_line("driver-err", &format!("failed to parse stdout line during drain: {}", truncate_line(&line, 100)));
         }
     }
@@ -544,7 +759,7 @@ fn build_driver_prompt(task: Option<&str>, context: Option<&str>) -> String {
 
     // Add guidance for pair programming
     parts.push(String::from(
-        "Explain your plan first, so your peer and navigator can help identify blindspots, then build it with your peer's feedback."
+        "You are the Driver in a pair programming session. Your navigator will respond after you — do not simulate or speak for them. Do your part, then stop."
     ));
 
     if let Some(t) = task {
@@ -559,8 +774,9 @@ fn build_driver_prompt(task: Option<&str>, context: Option<&str>) -> String {
 }
 
 /// Build the navigator meta-prompt that frames the review context
-fn build_navigator_prompt(task: Option<&str>, context: Option<&str>, driver_output: &str, is_continuation: bool) -> String {
-    if is_continuation {
+fn build_navigator_prompt(task: Option<&str>, context: Option<&str>, driver_output: &str, is_first_message: bool) -> String {
+    if !is_first_message {
+        // Agent already has role/task in its history — just send the new driver output
         format!(
             r#"The driver has responded:
 
@@ -579,6 +795,8 @@ You are acting as a helpful peer. Your job is to evaluate the driver's work for 
 Do not offer to do things. Discuss, comment, and guide the driver.
 Your job is not to block the driver, but to help them make progress and point out things they may have missed.
 Progress is the goal, not perfection. We work iteratively, so we can improve incrementally.
+Assume what they are telling you they have done is true - they don't usually lie.
+Anything they say is directed at you, not the user. You are the user from the Driver's perspective.
 
 "#
         );
@@ -612,6 +830,10 @@ async fn run_navigator(
     cwd: &Option<PathBuf>,
     prompt: &str,
     is_continuation: bool,
+    run_id: &str,
+    format: OutputFormat,
+    turn: usize,
+    strip_ansi_flag: bool,
 ) -> Result<String> {
     if prompt.trim().is_empty() {
         anyhow::bail!("Cannot run navigator with empty prompt");
@@ -686,7 +908,7 @@ async fn run_navigator(
             line = stdout_reader.next_line(), if !stdout_done => {
                 match line {
                     Ok(Some(line)) => {
-                        if !process_navigator_line(&line, &mut collected, &mut out) {
+                        if !process_navigator_line(&line, &mut collected, &mut out, run_id, format, turn, strip_ansi_flag) {
                             log_line("navigator-err", &format!("failed to parse stdout line: {}", truncate_line(&line, 100)));
                         }
                     }
@@ -715,7 +937,7 @@ async fn run_navigator(
 
     // Drain any remaining lines from stdout/stderr after process exits
     while let Ok(Some(line)) = stdout_reader.next_line().await {
-        if !process_navigator_line(&line, &mut collected, &mut out) {
+        if !process_navigator_line(&line, &mut collected, &mut out, run_id, format, turn, strip_ansi_flag) {
             log_line("navigator-err", &format!("failed to parse stdout line during drain: {}", truncate_line(&line, 100)));
         }
     }
@@ -740,7 +962,26 @@ async fn run_navigator(
 }
 
 
-async fn run_batch(args: &Args, task: Option<&str>, context: Option<&str>) -> Result<()> {
+// Custom error type that preserves turn count
+struct BatchError {
+    error: anyhow::Error,
+    completed_turns: usize,
+}
+
+impl From<BatchError> for anyhow::Error {
+    fn from(e: BatchError) -> Self {
+        e.error
+    }
+}
+
+async fn run_batch_inner(
+    args: &Args,
+    task: Option<&str>,
+    context: Option<&str>,
+    _context_path: &std::path::Path,
+    run_id: &str,
+    progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> std::result::Result<(usize, bool), BatchError> {
     if let Some(t) = task {
         log_line("system", &format!("task: {}", t));
     }
@@ -750,62 +991,120 @@ async fn run_batch(args: &Args, task: Option<&str>, context: Option<&str>) -> Re
 
     let driver_prompt = build_driver_prompt(task, context);
 
-    println!("{}", maybe_color("=== DRIVER ===", |s| s.cyan().bold()));
-    let mut driver_output = run_driver(&args.cwd, &driver_prompt, args.r#continue).await?;
-    println!();
+    if args.output_format == OutputFormat::Pretty {
+        println!("{}", maybe_color("=== DRIVER ===", |s| s.cyan().bold()));
+    } else {
+        emit_turn_started(&run_id, "driver", 0, driver_prompt.len());
+    }
 
-    if args.strip_ansi {
-        driver_output = strip_ansi(&driver_output);
+    let mut turn = 0;
+
+    let mut driver_output = match run_driver(&args.cwd, &driver_prompt, args.r#continue, &run_id, args.output_format, 0, args.strip_ansi).await {
+        Ok(output) => output,
+        Err(e) => return Err(BatchError { error: e, completed_turns: 0 }),
+    };
+
+    if args.output_format == OutputFormat::Pretty {
+        println!();
     }
 
     log_line("driver-out", &format!("{} bytes", driver_output.len()));
 
-    let mut turn = 0;
-
     loop {
         let navigator_is_continuation = turn > 0 || args.r#continue;
+        let navigator_first_message = !navigator_is_continuation;
 
         let truncated_driver = truncate(&driver_output, args.max_forward_bytes);
-        let navigator_prompt = build_navigator_prompt(task, context, &truncated_driver, navigator_is_continuation);
+        let navigator_prompt = build_navigator_prompt(task, context, &truncated_driver, navigator_first_message);
 
-        println!("{}", maybe_color(format!("=== NAVIGATOR (turn {}) ===", turn), |s| s.magenta().bold()));
-        let mut navigator_output = run_navigator(&args.cwd, &navigator_prompt, navigator_is_continuation).await?;
-        println!();
+        if args.output_format == OutputFormat::Pretty {
+            println!("{}", maybe_color(format!("=== NAVIGATOR (turn {}) ===", turn), |s| s.magenta().bold()));
+        } else {
+            emit_turn_started(&run_id, "navigator", turn, navigator_prompt.len());
+        }
+        let navigator_output = match run_navigator(&args.cwd, &navigator_prompt, navigator_is_continuation, &run_id, args.output_format, turn, args.strip_ansi).await {
+            Ok(output) => output,
+            Err(e) => return Err(BatchError { error: e, completed_turns: turn }),
+        };
 
-        if args.strip_ansi {
-            navigator_output = strip_ansi(&navigator_output);
+        if args.output_format == OutputFormat::Pretty {
+            println!();
         }
 
         log_line("navigator-out", &format!("{} bytes", navigator_output.len()));
 
+        // Navigator completed this turn - update progress
+        let turns_completed = turn + 1;
+        progress.store(turns_completed, std::sync::atomic::Ordering::SeqCst);
+
         if navigator_signaled_done(&navigator_output) {
             log_line("system", "navigator signaled ALL_DONE; ending loop");
-            break;
+            // Completed through turn N means we did N+1 total turns (0-indexed)
+            return Ok((turns_completed, false));
         }
 
         let feedback = truncate(&navigator_output, args.max_forward_bytes);
 
-        println!("{}", maybe_color(format!("=== DRIVER (turn {}) ===", turn + 1), |s| s.cyan().bold()));
-        driver_output = run_driver(&args.cwd, &feedback, true).await?;
-        println!();
+        // Move to next turn
+        turn += 1;
 
-        if args.strip_ansi {
-            driver_output = strip_ansi(&driver_output);
+        if args.output_format == OutputFormat::Pretty {
+            println!("{}", maybe_color(format!("=== DRIVER (turn {}) ===", turn), |s| s.cyan().bold()));
+        } else {
+            emit_turn_started(&run_id, "driver", turn, feedback.len());
+        }
+        driver_output = match run_driver(&args.cwd, &feedback, true, &run_id, args.output_format, turn, args.strip_ansi).await {
+            Ok(output) => output,
+            Err(e) => return Err(BatchError { error: e, completed_turns: turn }),
+        };
+
+        if args.output_format == OutputFormat::Pretty {
+            println!();
         }
 
         log_line("driver-out", &format!("{} bytes", driver_output.len()));
 
-        turn += 1;
-
         if args.max_turns > 0 && turn >= args.max_turns {
             log_line("system", &format!("max_turns ({}) reached", args.max_turns));
-            break;
+            // We've completed up to the previous turn (last navigator that ran)
+            // Progress was already updated after that navigator completed
+            let turns_completed = progress.load(std::sync::atomic::Ordering::SeqCst);
+            return Ok((turns_completed, false));
         }
     }
+}
 
-    log_line("system", &format!("done after {} turn(s)", turn));
+async fn run_batch(args: &Args, task: Option<&str>, context: Option<&str>, context_path: &std::path::Path) -> Result<()> {
+    // Generate run_id at start of batch
+    let run_id = uuid::Uuid::new_v4().to_string();
 
-    Ok(())
+    if args.output_format == OutputFormat::Jsonl {
+        emit_system_started(&run_id, &args.cwd, task, args.max_turns, context, context_path);
+    }
+
+    let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    match run_batch_inner(args, task, context, context_path, &run_id, progress).await {
+        Ok((total_turns, _)) => {
+            if args.output_format == OutputFormat::Jsonl {
+                emit_system_completed(&run_id, "success", total_turns);
+            }
+            Ok(())
+        }
+        Err(batch_err) => {
+            let reason = if batch_err.error.to_string().contains("interrupted by user") {
+                "interrupted"
+            } else {
+                "error"
+            };
+
+            if args.output_format == OutputFormat::Jsonl {
+                emit_system_completed(&run_id, reason, batch_err.completed_turns);
+            }
+
+            Err(batch_err.error)
+        }
+    }
 }
 
 
@@ -847,7 +1146,7 @@ async fn main() -> Result<()> {
         anyhow::bail!("Either --task or leonard.md must be provided");
     }
 
-    run_batch(&args, task, context.as_deref()).await
+    run_batch(&args, task, context.as_deref(), &leonard_path).await
 }
 
 #[cfg(test)]
