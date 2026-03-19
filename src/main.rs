@@ -981,6 +981,7 @@ async fn run_batch_inner(
     _context_path: &std::path::Path,
     run_id: &str,
     progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    initial_continuation: bool,
 ) -> std::result::Result<(usize, bool), BatchError> {
     if let Some(t) = task {
         log_line("system", &format!("task: {}", t));
@@ -999,7 +1000,7 @@ async fn run_batch_inner(
 
     let mut turn = 0;
 
-    let mut driver_output = match run_driver(&args.cwd, &driver_prompt, args.r#continue, &run_id, args.output_format, 0, args.strip_ansi).await {
+    let mut driver_output = match run_driver(&args.cwd, &driver_prompt, initial_continuation, &run_id, args.output_format, 0, args.strip_ansi).await {
         Ok(output) => output,
         Err(e) => return Err(BatchError { error: e, completed_turns: 0 }),
     };
@@ -1011,7 +1012,7 @@ async fn run_batch_inner(
     log_line("driver-out", &format!("{} bytes", driver_output.len()));
 
     loop {
-        let navigator_is_continuation = turn > 0 || args.r#continue;
+        let navigator_is_continuation = turn > 0 || initial_continuation;
         let navigator_first_message = !navigator_is_continuation;
 
         let truncated_driver = truncate(&driver_output, args.max_forward_bytes);
@@ -1074,7 +1075,7 @@ async fn run_batch_inner(
     }
 }
 
-async fn run_batch(args: &Args, task: Option<&str>, context: Option<&str>, context_path: &std::path::Path) -> Result<()> {
+async fn run_batch(args: &Args, task: Option<&str>, context: Option<&str>, context_path: &std::path::Path, initial_continuation: bool) -> Result<()> {
     // Generate run_id at start of batch
     let run_id = uuid::Uuid::new_v4().to_string();
 
@@ -1084,7 +1085,7 @@ async fn run_batch(args: &Args, task: Option<&str>, context: Option<&str>, conte
 
     let progress = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    match run_batch_inner(args, task, context, context_path, &run_id, progress).await {
+    match run_batch_inner(args, task, context, context_path, &run_id, progress, initial_continuation).await {
         Ok((total_turns, _)) => {
             if args.output_format == OutputFormat::Jsonl {
                 emit_system_completed(&run_id, "success", total_turns);
@@ -1110,7 +1111,7 @@ async fn run_batch(args: &Args, task: Option<&str>, context: Option<&str>, conte
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     // Run preflight checks before starting orchestration
     validate_prerequisites(&args).await?;
@@ -1125,7 +1126,7 @@ async fn main() -> Result<()> {
     let context = if leonard_path.exists() {
         match std::fs::read_to_string(&leonard_path) {
             Ok(content) if !content.trim().is_empty() => Some(content),
-            Ok(_) => None, // Empty/whitespace-only
+            Ok(_) => None,
             Err(e) => {
                 log_line("system", &format!("warning: failed to read leonard.md: {}", e));
                 None
@@ -1141,12 +1142,48 @@ async fn main() -> Result<()> {
         if trimmed.is_empty() { None } else { Some(trimmed) }
     });
 
-    // Validate we have at least one input
-    if task.is_none() && context.is_none() {
-        anyhow::bail!("Either --task or leonard.md must be provided");
-    }
+    if task.is_some() {
+        // Single-shot mode: --task was provided
+        run_batch(&args, task, context.as_deref(), &leonard_path, args.r#continue).await
+    } else {
+        // Interactive mode: prompt for tasks in a loop
+        args.output_format = OutputFormat::Pretty;
 
-    run_batch(&args, task, context.as_deref(), &leonard_path).await
+        let stdin = tokio::io::stdin();
+        let mut reader = tokio::io::BufReader::new(stdin);
+        let mut line_buf = String::new();
+        let mut session_started = args.r#continue;
+
+        loop {
+            eprint!("\ntask> ");
+            let _ = std::io::stderr().flush();
+
+            line_buf.clear();
+            match reader.read_line(&mut line_buf).await {
+                Ok(0) => break, // EOF
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("stdin error: {}", e);
+                    break;
+                }
+            }
+
+            let task = line_buf.trim().to_string();
+            if task.is_empty() {
+                break;
+            }
+
+            match run_batch(&args, Some(&task), context.as_deref(), &leonard_path, session_started).await {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("interrupted by user") => break,
+                Err(e) => eprintln!("error: {}", e),
+            }
+
+            session_started = true;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
