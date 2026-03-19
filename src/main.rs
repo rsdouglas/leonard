@@ -776,12 +776,18 @@ fn build_driver_prompt(task: Option<&str>, context: Option<&str>) -> String {
     parts.join("\n\n")
 }
 
+fn task_prefix(task: Option<&str>) -> String {
+    match task {
+        Some(t) => format!("## Supervisor Task\n{}\n\n", t),
+        None => String::new(),
+    }
+}
+
 /// Build the navigator meta-prompt that frames the review context
 fn build_navigator_prompt(task: Option<&str>, context: Option<&str>, driver_output: &str, is_first_message: bool) -> String {
     if !is_first_message {
-        // Agent already has role/task in its history — just send the new driver output
         format!(
-            r#"The driver has responded:
+            r#"{prefix}The driver has responded:
 
 ---
 {driver_output}
@@ -789,6 +795,7 @@ fn build_navigator_prompt(task: Option<&str>, context: Option<&str>, driver_outp
 
 Review this response. If the task is complete, respond with "ALL_DONE".
 "#,
+            prefix = task_prefix(task),
             driver_output = driver_output
         )
     } else {
@@ -1047,7 +1054,10 @@ async fn run_batch_inner(
             return Ok((turns_completed, false));
         }
 
-        let feedback = truncate(&navigator_output, args.max_forward_bytes);
+        let feedback = format!("{}{}",
+            task_prefix(task),
+            truncate(&navigator_output, args.max_forward_bytes)
+        );
 
         // Move to next turn
         turn += 1;
