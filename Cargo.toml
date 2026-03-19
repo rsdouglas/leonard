@@ -18,3 +18,4 @@ strip-ansi-escapes = "0.2"
 time = { version = "0.3", features = ["local-offset", "formatting"] }
 tokio = { version = "1.49.0", features = ["rt", "macros", "process", "signal", "io-util", "io-std", "time"] }
 uuid = { version = "1.11", features = ["v4"] }
+rustyline = "14"

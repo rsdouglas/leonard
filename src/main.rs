@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use colored::{ColoredString, Colorize};
+use rustyline::config::Configurer;
+use rustyline::KeyCode;
+use rustyline::{Cmd, Editor, EventHandler, KeyEvent, Modifiers};
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
@@ -1149,29 +1152,34 @@ async fn main() -> Result<()> {
         // Interactive mode: prompt for tasks in a loop
         args.output_format = OutputFormat::Pretty;
 
-        let stdin = tokio::io::stdin();
-        let mut reader = tokio::io::BufReader::new(stdin);
-        let mut line_buf = String::new();
+        let mut rl: Editor<(), rustyline::history::DefaultHistory> =
+            Editor::new().context("failed to init readline")?;
+        rl.set_max_history_size(100).ok();
+        // Shift+Enter inserts a newline instead of submitting
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Enter, Modifiers::SHIFT),
+            EventHandler::Simple(Cmd::Newline),
+        );
+
         let mut session_started = args.r#continue;
 
         loop {
-            eprint!("\ntask> ");
-            let _ = std::io::stderr().flush();
-
-            line_buf.clear();
-            match reader.read_line(&mut line_buf).await {
-                Ok(0) => break, // EOF
-                Ok(_) => {}
+            let input = match rl.readline("\ntask> ") {
+                Ok(line) => line,
+                Err(rustyline::error::ReadlineError::Eof) => break,
+                Err(rustyline::error::ReadlineError::Interrupted) => break,
                 Err(e) => {
-                    eprintln!("stdin error: {}", e);
+                    eprintln!("readline error: {}", e);
                     break;
                 }
+            };
+
+            let task = input.trim().to_string();
+            if task.is_empty() {
+                continue;
             }
 
-            let task = line_buf.trim().to_string();
-            if task.is_empty() {
-                break;
-            }
+            rl.add_history_entry(&task).ok();
 
             match run_batch(&args, Some(&task), context.as_deref(), &leonard_path, session_started).await {
                 Ok(()) => {}
