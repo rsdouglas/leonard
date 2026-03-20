@@ -667,6 +667,7 @@ async fn run_driver(
         cmd.env("ANTHROPIC_API_KEY", key);
     }
 
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
@@ -867,6 +868,7 @@ async fn run_navigator(
         cmd.env("OPENAI_API_KEY", key);
     }
 
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
