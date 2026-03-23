@@ -1164,7 +1164,12 @@ async fn main() -> Result<()> {
         let mut rl: Editor<(), rustyline::history::DefaultHistory> =
             Editor::new().context("failed to init readline")?;
         rl.set_max_history_size(100).ok();
-        // Shift+Enter inserts a newline instead of submitting
+        // Alt/Option+Enter inserts a newline (works on Terminal.app, iTerm2, etc.)
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Enter, Modifiers::ALT),
+            EventHandler::Simple(Cmd::Newline),
+        );
+        // Shift+Enter also inserts a newline for terminals with kitty keyboard protocol
         rl.bind_sequence(
             KeyEvent(KeyCode::Enter, Modifiers::SHIFT),
             EventHandler::Simple(Cmd::Newline),
