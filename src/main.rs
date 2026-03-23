@@ -1164,16 +1164,25 @@ async fn main() -> Result<()> {
         let mut rl: Editor<(), rustyline::history::DefaultHistory> =
             Editor::new().context("failed to init readline")?;
         rl.set_max_history_size(100).ok();
-        // Alt/Option+Enter inserts a newline (works on Terminal.app, iTerm2, etc.)
-        rl.bind_sequence(
-            KeyEvent(KeyCode::Enter, Modifiers::ALT),
-            EventHandler::Simple(Cmd::Newline),
-        );
-        // Shift+Enter also inserts a newline for terminals with kitty keyboard protocol
+        // Shift+Enter inserts a newline
         rl.bind_sequence(
             KeyEvent(KeyCode::Enter, Modifiers::SHIFT),
             EventHandler::Simple(Cmd::Newline),
         );
+        // Alt/Option+Enter also inserts a newline (fallback for terminals without kitty protocol)
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Enter, Modifiers::ALT),
+            EventHandler::Simple(Cmd::Newline),
+        );
+
+        // Enable kitty keyboard protocol so the terminal sends distinguishable sequences
+        // for Shift+Enter (supported by iTerm2 3.4+, WezTerm, Kitty, etc.)
+        // Terminals that don't support it safely ignore this sequence.
+        let kitty_enabled = std::io::stdout().is_terminal();
+        if kitty_enabled {
+            print!("\x1b[>1u");
+            let _ = std::io::stdout().flush();
+        }
 
         let mut session_started = args.r#continue;
 
@@ -1202,6 +1211,12 @@ async fn main() -> Result<()> {
             }
 
             session_started = true;
+        }
+
+        // Restore terminal keyboard protocol
+        if kitty_enabled {
+            print!("\x1b[<u");
+            let _ = std::io::stdout().flush();
         }
 
         Ok(())
