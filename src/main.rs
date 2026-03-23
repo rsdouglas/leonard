@@ -1169,15 +1169,24 @@ async fn main() -> Result<()> {
             KeyEvent(KeyCode::Enter, Modifiers::SHIFT),
             EventHandler::Simple(Cmd::Newline),
         );
-        // Alt/Option+Enter also inserts a newline (fallback for terminals without kitty protocol)
+        // Alt/Option+Enter also inserts a newline (fallback)
         rl.bind_sequence(
             KeyEvent(KeyCode::Enter, Modifiers::ALT),
             EventHandler::Simple(Cmd::Newline),
         );
+        // With modifyOtherKeys active, Ctrl+C is sent as \x1b[99;5u instead of \x03.
+        // Explicitly bind it so rustyline still interrupts.
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Char('c'), Modifiers::CTRL),
+            EventHandler::Simple(Cmd::Interrupt),
+        );
+        rl.bind_sequence(
+            KeyEvent(KeyCode::Char('d'), Modifiers::CTRL),
+            EventHandler::Simple(Cmd::EndOfFile),
+        );
 
-        // Enable modifyOtherKeys level 2 so the terminal sends a distinguishable sequence
-        // for Shift+Enter (\x1b[13;2u) while leaving Ctrl+C and other control chars alone.
-        // Supported by iTerm2, xterm, WezTerm. Terminals that don't support it ignore it.
+        // Enable modifyOtherKeys level 2: Shift+Enter sends \x1b[13;2u (distinguishable).
+        // Ctrl+C becomes \x1b[99;5u — handled by the explicit binding above.
         let modify_other_keys_enabled = std::io::stdout().is_terminal();
         if modify_other_keys_enabled {
             print!("\x1b[>4;2m");
