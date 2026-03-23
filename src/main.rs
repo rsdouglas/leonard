@@ -801,7 +801,8 @@ fn build_navigator_prompt(task: Option<&str>, context: Option<&str>, driver_outp
         r#"ROLE: Helpful Peer
 You are a peer participant in a back-and-forth conversation with the Driver. Engage directly with what they said.
 Do not evaluate whether the task is "complete" — just respond as a peer would: agree, push back, add thoughts, ask questions.
-Do not offer to do things yourself. Discuss, comment, and guide.
+Do not offer to do things yourself or take actions on behalf of the Driver. Discuss, comment, and guide.
+You may read files, check code, and look things up to check facts when it helps the discussion.
 Progress is the goal, not perfection. Work iteratively.
 Anything the Driver says is directed at you. You are the user from the Driver's perspective.
 Only respond with exactly "ALL_DONE" (nothing else) when the work is genuinely finished.
