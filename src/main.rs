@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use colored::{ColoredString, Colorize};
-use rustyline::config::Configurer;
-use rustyline::KeyCode;
-use rustyline::{Cmd, Editor, EventHandler, KeyEvent, Modifiers};
+use reedline::{
+    default_emacs_keybindings, DefaultPrompt, DefaultPromptSegment, EditCommand,
+    Emacs, KeyCode, KeyModifiers, Reedline, ReedlineEvent, Signal,
+};
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write as _};
 use std::path::PathBuf;
@@ -1161,71 +1162,49 @@ async fn main() -> Result<()> {
         // Interactive mode: prompt for tasks in a loop
         args.output_format = OutputFormat::Pretty;
 
-        let mut rl: Editor<(), rustyline::history::DefaultHistory> =
-            Editor::new().context("failed to init readline")?;
-        rl.set_max_history_size(100).ok();
-        // Shift+Enter inserts a newline
-        rl.bind_sequence(
-            KeyEvent(KeyCode::Enter, Modifiers::SHIFT),
-            EventHandler::Simple(Cmd::Newline),
+        let mut keybindings = default_emacs_keybindings();
+        keybindings.add_binding(
+            KeyModifiers::SHIFT,
+            KeyCode::Enter,
+            ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
         );
-        // Alt/Option+Enter also inserts a newline (fallback)
-        rl.bind_sequence(
-            KeyEvent(KeyCode::Enter, Modifiers::ALT),
-            EventHandler::Simple(Cmd::Newline),
-        );
-        // With modifyOtherKeys active, Ctrl+C is sent as \x1b[99;5u instead of \x03.
-        // Explicitly bind it so rustyline still interrupts.
-        rl.bind_sequence(
-            KeyEvent(KeyCode::Char('c'), Modifiers::CTRL),
-            EventHandler::Simple(Cmd::Interrupt),
-        );
-        rl.bind_sequence(
-            KeyEvent(KeyCode::Char('d'), Modifiers::CTRL),
-            EventHandler::Simple(Cmd::EndOfFile),
+        keybindings.add_binding(
+            KeyModifiers::ALT,
+            KeyCode::Enter,
+            ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
         );
 
-        // Enable modifyOtherKeys level 2: Shift+Enter sends \x1b[13;2u (distinguishable).
-        // Ctrl+C becomes \x1b[99;5u — handled by the explicit binding above.
-        let modify_other_keys_enabled = std::io::stdout().is_terminal();
-        if modify_other_keys_enabled {
-            print!("\x1b[>4;2m");
-            let _ = std::io::stdout().flush();
-        }
+        let mut rl = Reedline::create()
+            .with_edit_mode(Box::new(Emacs::new(keybindings)));
+
+        let prompt = DefaultPrompt {
+            left_prompt: DefaultPromptSegment::Basic("task".to_string()),
+            right_prompt: DefaultPromptSegment::Empty,
+        };
 
         let mut session_started = args.r#continue;
 
         loop {
-            let input = match rl.readline("\ntask> ") {
-                Ok(line) => line,
-                Err(rustyline::error::ReadlineError::Eof) => break,
-                Err(rustyline::error::ReadlineError::Interrupted) => break,
+            println!();
+            match rl.read_line(&prompt) {
+                Ok(Signal::Success(input)) => {
+                    let task = input.trim().to_string();
+                    if task.is_empty() {
+                        continue;
+                    }
+                    match run_batch(&args, Some(&task), context.as_deref(), &leonard_path, session_started).await {
+                        Ok(()) => {}
+                        Err(e) if e.to_string().contains("interrupted by user") => break,
+                        Err(e) => eprintln!("error: {}", e),
+                    }
+                    session_started = true;
+                }
+                Ok(Signal::CtrlC) | Ok(Signal::CtrlD) => break,
                 Err(e) => {
                     eprintln!("readline error: {}", e);
                     break;
                 }
-            };
-
-            let task = input.trim().to_string();
-            if task.is_empty() {
-                continue;
             }
-
-            rl.add_history_entry(&task).ok();
-
-            match run_batch(&args, Some(&task), context.as_deref(), &leonard_path, session_started).await {
-                Ok(()) => {}
-                Err(e) if e.to_string().contains("interrupted by user") => break,
-                Err(e) => eprintln!("error: {}", e),
-            }
-
-            session_started = true;
-        }
-
-        // Restore modifyOtherKeys
-        if modify_other_keys_enabled {
-            print!("\x1b[>4m");
-            let _ = std::io::stdout().flush();
         }
 
         Ok(())
