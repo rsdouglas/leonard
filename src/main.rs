@@ -1175,12 +1175,12 @@ async fn main() -> Result<()> {
             EventHandler::Simple(Cmd::Newline),
         );
 
-        // Enable kitty keyboard protocol so the terminal sends distinguishable sequences
-        // for Shift+Enter (supported by iTerm2 3.4+, WezTerm, Kitty, etc.)
-        // Terminals that don't support it safely ignore this sequence.
-        let kitty_enabled = std::io::stdout().is_terminal();
-        if kitty_enabled {
-            print!("\x1b[>1u");
+        // Enable modifyOtherKeys level 2 so the terminal sends a distinguishable sequence
+        // for Shift+Enter (\x1b[13;2u) while leaving Ctrl+C and other control chars alone.
+        // Supported by iTerm2, xterm, WezTerm. Terminals that don't support it ignore it.
+        let modify_other_keys_enabled = std::io::stdout().is_terminal();
+        if modify_other_keys_enabled {
+            print!("\x1b[>4;2m");
             let _ = std::io::stdout().flush();
         }
 
@@ -1213,9 +1213,9 @@ async fn main() -> Result<()> {
             session_started = true;
         }
 
-        // Restore terminal keyboard protocol
-        if kitty_enabled {
-            print!("\x1b[<u");
+        // Restore modifyOtherKeys
+        if modify_other_keys_enabled {
+            print!("\x1b[>4m");
             let _ = std::io::stdout().flush();
         }
 
