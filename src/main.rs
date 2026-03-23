@@ -830,7 +830,7 @@ Only respond with exactly "ALL_DONE" (nothing else) when the work is genuinely f
     prompt
 }
 
-/// Run Codex exec with JSON mode and return its output (read-only sandbox)
+/// Run Codex exec with JSON mode and return its output
 async fn run_navigator(
     cwd: &Option<PathBuf>,
     prompt: &str,
@@ -855,7 +855,6 @@ async fn run_navigator(
         cmd.arg("--json");
         cmd.arg(prompt);
     } else {
-        cmd.arg("--sandbox").arg("read-only");
         cmd.arg("--json");
         cmd.arg(prompt);
     }
