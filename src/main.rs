@@ -1175,7 +1175,8 @@ async fn main() -> Result<()> {
         );
 
         let mut rl = Reedline::create()
-            .with_edit_mode(Box::new(Emacs::new(keybindings)));
+            .with_edit_mode(Box::new(Emacs::new(keybindings)))
+            .use_bracketed_paste(true);
 
         let prompt = DefaultPrompt {
             left_prompt: DefaultPromptSegment::Basic("task".to_string()),
