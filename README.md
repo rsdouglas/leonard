@@ -69,7 +69,7 @@ Leonard requires:
 
 3. **`codex` CLI** - OpenAI Codex CLI tool
    - Used as the Navigator agent (reviews and guides)
-   - Must support `exec`, `--sandbox read-only`, `--json`
+   - Must support `exec`, `--json`, and `resume --last`
    - Requires `OPENAI_API_KEY` environment variable
 
 ## Installation
@@ -93,7 +93,28 @@ cargo build --release
 
 ## Usage
 
-Basic usage:
+### Interactive mode (recommended)
+
+Run without `--task` to enter an interactive prompt. Leonard asks for a task, runs the pair-programming loop until the agents agree it's done, then asks for the next task. Both agents carry their full session history across tasks.
+
+```bash
+leonard --cwd /path/to/repo
+```
+
+At the prompt:
+- **Enter** — submit the task
+- **Shift+Enter** or **Alt+Enter** — insert a newline (for multi-line tasks or pasting context)
+- **Ctrl+C** / **Ctrl+D** / empty input — exit
+
+Use `-c` / `--continue` to resume your previous agent sessions from a prior run:
+
+```bash
+leonard -c --cwd /path/to/repo
+```
+
+### Single-shot mode
+
+Pass `--task` to run one loop and exit:
 
 ```bash
 leonard --cwd /path/to/repo --task "Add error handling to the login function" --max-turns 5
@@ -104,12 +125,13 @@ leonard --cwd /path/to/repo --task "Add error handling to the login function" --
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--cwd <path>` | Working directory for both agents | current directory |
-| `--task <string>` | Initial task prompt for the Driver | (required) |
-| `--max-turns <n>` | Maximum relay turns (0 = unlimited) | 10 |
+| `--task <string>` | Task prompt — omit for interactive mode | (none) |
+| `--max-turns <n>` | Maximum relay turns per task (0 = unlimited) | 10 |
 | `--strip-ansi` | Strip ANSI escape codes from output | true |
 | `--max-forward-bytes <n>` | Max bytes forwarded between agents | 100000 |
-| `-c, --continue` | Resume previous Claude session | false |
+| `-c, --continue` | Resume previous agent sessions | false |
 | `--log-file <path>` | Log prompts and responses to file | (none) |
+| `--output-format <format>` | Output format: `pretty` or `jsonl` | pretty |
 
 ### Environment Variables
 
@@ -120,23 +142,6 @@ Required:
 Optional:
 - Use `.envrc` with [direnv](https://direnv.net/) for automatic loading
 - Or export manually: `export ANTHROPIC_API_KEY=...`
-
-### Example
-
-Run Leonard on a codebase with a specific task:
-
-```bash
-# Set environment variables
-source .envrc
-
-# Run a 3-turn pair-programming loop
-cargo run -- \
-  --cwd /path/to/your/project \
-  --task "Refactor the database connection code to use connection pooling" \
-  --max-turns 3
-```
-
-For testing without waiting, use background execution (see CLAUDE.md).
 
 ## Per-Repository Context (`leonard.md`)
 
@@ -173,9 +178,9 @@ This is a React + TypeScript project using Vite.
 Leonard runs preflight checks at startup to validate that `claude` and `codex` binaries are available and warn if API keys are missing.
 
 1. **Driver turn**: Leonard spawns `claude -p` with the task, captures stdout and parses JSON events to extract text
-2. **Navigator turn**: Extracted Driver text is forwarded to `codex exec --sandbox read-only` (first turn) or `codex resume --last` (continuation)
-3. **Driver continuation**: Navigator feedback is parsed from JSONL and sent to `claude -p --continue`
-4. **Repeat**: Steps 2-3 repeat until max-turns reached or interrupted
+2. **Navigator turn**: Extracted Driver text is forwarded to `codex exec --json` (first turn) or `codex exec resume --last --json` (continuation)
+3. **Driver continuation**: Navigator feedback is sent to `claude -p --continue`
+4. **Repeat**: Steps 2-3 repeat until the Navigator signals `ALL_DONE` or max-turns is reached
 
 Output is streamed to stdout with section headers (`=== DRIVER ===`, `=== NAVIGATOR (turn N) ===`). Logs with timestamps go to stderr.
 
@@ -194,6 +199,35 @@ Contributions welcome. Before opening a PR:
 ## License
 
 MIT License - see LICENSE file for details.
+
+## Programmatic Usage (Node.js)
+
+Leonard can be used as a subprocess with structured output for integration into other tools:
+
+```javascript
+const { spawn } = require('child_process');
+const readline = require('readline');
+
+const leonard = spawn('leonard', [
+  '--cwd', './my-project',
+  '--task', 'Fix the bug in auth.rs',
+  '--output-format', 'jsonl'
+]);
+
+// Use readline to properly handle line buffering
+const rl = readline.createInterface({
+  input: leonard.stdout,
+  crlfDelay: Infinity
+});
+
+rl.on('line', (line) => {
+  if (!line.trim()) return;
+  const event = JSON.parse(line);
+  console.log(`[${event.agent}] ${event.type}`);
+});
+```
+
+See [STREAMING_DESIGN.md](./STREAMING_DESIGN.md) for full API documentation.
 
 ## Notes
 
